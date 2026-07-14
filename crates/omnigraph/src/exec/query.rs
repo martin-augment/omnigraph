@@ -35,9 +35,11 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
-        // resolved_target validates the schema contract; no redundant call here.
-        let resolved = self.resolved_target(target).await?;
-        let catalog = self.catalog();
+        // Capture the manifest snapshot and immutable catalog under the same
+        // schema-publication gate. SchemaApply publishes its fixed manifest
+        // outcome before promoting files/ArcSwap; without this gate a query on
+        // the applying handle could pair that new snapshot with the old catalog.
+        let (resolved, catalog) = self.capture_read_view(target).await?;
 
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
@@ -50,7 +52,11 @@ impl Omnigraph {
             .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
         // Lazy: an index-served query with no AntiJoin never builds the CSR.
         let graph_index = if needs_graph {
-            GraphIndexHandle::cached(self, &resolved)
+            GraphIndexHandle::cached(
+                self,
+                &resolved,
+                referenced_edge_types(&ir.pipeline, &catalog),
+            )
         } else {
             GraphIndexHandle::none()
         };
@@ -80,9 +86,10 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
-        // snapshot_at_version validates the schema contract; no redundant call here.
-        let snapshot = self.snapshot_at_version(version).await?;
-        let catalog = self.catalog();
+        // Historical resolution still uses the current accepted catalog, so
+        // capture both sides of that view under schema publication just like a
+        // live-target query.
+        let (snapshot, catalog) = self.capture_historical_read_view(version).await?;
 
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
@@ -95,14 +102,9 @@ impl Omnigraph {
             .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
         // Lazy build against this historical snapshot (not the RuntimeCache,
         // which is keyed to live branch targets); only a CSR-path Expand or an
-        // AntiJoin triggers it.
+        // AntiJoin triggers it. Scoped to the edges this query traverses.
         let graph_index = if needs_graph {
-            let edge_types = catalog
-                .edge_types
-                .iter()
-                .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
-                .collect();
-            GraphIndexHandle::direct(&snapshot, edge_types)
+            GraphIndexHandle::direct(&snapshot, referenced_edge_types(&ir.pipeline, &catalog))
         } else {
             GraphIndexHandle::none()
         };
@@ -762,6 +764,51 @@ fn execute_pipeline<'a>(
     })
 }
 
+/// The edge types a query's pipeline actually traverses, mapped to their
+/// `(from_type, to_type)` endpoints. Recurses through `AntiJoin` inner pipelines
+/// (whose bulk fast path consumes the CSR for the inner `Expand`'s edge). The
+/// CSR build is scoped to exactly this set instead of every edge type in the
+/// catalog — otherwise a single-edge join (`$x identifiesPerson $p`) that lands
+/// on the CSR path would scan the whole graph's edge data (every message,
+/// relationship, … table), the cause of the cross-edge-join hang. Empty when the
+/// only traversal is an `AntiJoin` with no inner `Expand` — that shape never asks
+/// the handle for an index, so an empty build is never realized.
+fn referenced_edge_types(
+    pipeline: &[IROp],
+    catalog: &Catalog,
+) -> HashMap<String, (String, String)> {
+    let mut names = std::collections::BTreeSet::new();
+    collect_referenced_edge_names(pipeline, &mut names);
+    names
+        .into_iter()
+        .filter_map(|name| {
+            catalog
+                .edge_types
+                .get(&name)
+                .map(|et| (name, (et.from_type.clone(), et.to_type.clone())))
+        })
+        .collect()
+}
+
+fn collect_referenced_edge_names(
+    pipeline: &[IROp],
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    for op in pipeline {
+        match op {
+            IROp::Expand { edge_type, .. } => {
+                out.insert(edge_type.clone());
+            }
+            IROp::AntiJoin { inner, .. } => collect_referenced_edge_names(inner, out),
+            // Exhaustive on purpose (no `_` arm): a new edge-referencing IROp must
+            // force a compile error here rather than silently under-scope the CSR
+            // build — an omitted edge would fail at runtime with "no adjacency
+            // index for edge". The non-traversal ops reference no edges.
+            IROp::NodeScan { .. } | IROp::Filter(_) => {}
+        }
+    }
+}
+
 /// Lazily provides the in-memory CSR graph index, building it on first use and
 /// memoizing for the rest of the query. Indexed-mode Expand never asks for it,
 /// so a query that is entirely index-served and has no AntiJoin never pays the
@@ -776,7 +823,11 @@ pub struct GraphIndexHandle<'a> {
 
 enum GraphIndexBuilder<'a> {
     None,
-    Cached(&'a Omnigraph, &'a crate::db::ResolvedTarget),
+    Cached(
+        &'a Omnigraph,
+        &'a crate::db::ResolvedTarget,
+        HashMap<String, (String, String)>,
+    ),
     Direct(&'a Snapshot, HashMap<String, (String, String)>),
 }
 
@@ -788,10 +839,14 @@ impl<'a> GraphIndexHandle<'a> {
         }
     }
 
-    fn cached(db: &'a Omnigraph, resolved: &'a crate::db::ResolvedTarget) -> Self {
+    fn cached(
+        db: &'a Omnigraph,
+        resolved: &'a crate::db::ResolvedTarget,
+        edge_types: HashMap<String, (String, String)>,
+    ) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
-            builder: GraphIndexBuilder::Cached(db, resolved),
+            builder: GraphIndexBuilder::Cached(db, resolved, edge_types),
         }
     }
 
@@ -810,8 +865,8 @@ impl<'a> GraphIndexHandle<'a> {
             .get_or_try_init(|| async {
                 match &self.builder {
                     GraphIndexBuilder::None => Ok::<Option<Arc<GraphIndex>>, OmniError>(None),
-                    GraphIndexBuilder::Cached(db, resolved) => {
-                        Ok(Some(db.graph_index_for_resolved(resolved).await?))
+                    GraphIndexBuilder::Cached(db, resolved, edge_types) => {
+                        Ok(Some(db.graph_index_for_resolved(resolved, edge_types).await?))
                     }
                     GraphIndexBuilder::Direct(snapshot, edge_types) => {
                         Ok(Some(Arc::new(GraphIndex::build(snapshot, edge_types).await?)))
@@ -834,7 +889,12 @@ impl<'a> GraphIndexHandle<'a> {
 /// forces the path (ops escape hatch + test hook). Both modes are semantically
 /// identical, so the override only changes which path runs, never the result.
 fn traversal_indexed_override() -> Option<bool> {
-    match std::env::var("OMNIGRAPH_TRAVERSAL_MODE").ok().as_deref() {
+    // The scoped test seam (`with_traversal_mode`) takes precedence over the
+    // process-global `OMNIGRAPH_TRAVERSAL_MODE` ops escape hatch.
+    let mode = crate::instrumentation::traversal_mode_override()
+        .map(str::to_string)
+        .or_else(|| std::env::var("OMNIGRAPH_TRAVERSAL_MODE").ok());
+    match mode.as_deref() {
         Some("indexed") => Some(true),
         Some("csr") => Some(false),
         _ => None,
@@ -993,6 +1053,8 @@ fn gather_cost_inputs(
     let src_type = match direction {
         Direction::Out => &edge_def.from_type,
         Direction::In => &edge_def.to_type,
+        // Both requires from_type == to_type (typecheck T22).
+        Direction::Both => &edge_def.from_type,
     };
     let src_entry = snapshot.entry(&format!("node:{}", src_type))?;
     Some(ExpandCostInputs {
@@ -1052,7 +1114,35 @@ fn warn_on_degraded_coverage(
 fn endpoint_columns(direction: Direction) -> (&'static str, &'static str) {
     match direction {
         Direction::Out => ("src", "dst"),
+        // Both: the primary orientation (used by the cost probe; the indexed
+        // execution loop adds the reverse probe itself via endpoint_probes).
         Direction::In => ("dst", "src"),
+        Direction::Both => ("src", "dst"),
+    }
+}
+
+/// The pessimistic combination of two coverage probes: Degraded dominates
+/// (an undirected traversal pays whichever of its two columns is worse).
+fn worse_coverage(
+    a: crate::table_store::IndexCoverage,
+    b: crate::table_store::IndexCoverage,
+) -> crate::table_store::IndexCoverage {
+    use crate::table_store::IndexCoverage;
+    match (a, b) {
+        (IndexCoverage::Indexed, IndexCoverage::Indexed) => IndexCoverage::Indexed,
+        (IndexCoverage::Degraded { reason }, _) | (_, IndexCoverage::Degraded { reason }) => {
+            IndexCoverage::Degraded { reason }
+        }
+    }
+}
+
+/// All (key, opposite) probes a direction requires: one for Out/In, both
+/// orientations for an undirected traversal.
+fn endpoint_probes(direction: Direction) -> &'static [(&'static str, &'static str)] {
+    match direction {
+        Direction::Out => &[("src", "dst")],
+        Direction::In => &[("dst", "src")],
+        Direction::Both => &[("src", "dst"), ("dst", "src")],
     }
 }
 
@@ -1130,9 +1220,20 @@ async fn execute_expand(
     // Leaning indexed: open the edge dataset once, confirm real coverage, and
     // (unless forced) re-decide with it. The opened dataset is threaded into the
     // indexed path so it is never opened twice.
-    let edge_ds = snapshot.open(&edge_table_key).await?;
-    let coverage =
+    let edge_ds = snapshot.open_dataset(&edge_table_key).await?;
+    // An undirected traversal scans BOTH endpoint columns; price it by the
+    // worst coverage of the columns it will actually probe (a degraded dst
+    // index must not be masked by a healthy src index).
+    let mut coverage =
         crate::table_store::TableStore::key_column_index_coverage(&edge_ds, key_col).await;
+    for &(extra_key, _) in endpoint_probes(direction).iter().skip(1) {
+        let extra =
+            crate::table_store::TableStore::key_column_index_coverage(&edge_ds, extra_key).await;
+        coverage = match (coverage, extra) {
+            (Ok(a), Ok(b)) => Ok(worse_coverage(a, b)),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        };
+    }
 
     if forced.is_none() {
         if let Some(inputs) = gather_cost_inputs(
@@ -1224,7 +1325,7 @@ async fn execute_expand_indexed(
     // The keyed/opposite endpoint columns for this direction. The edge dataset
     // and the C6 coverage warn are owned by the caller (`execute_expand`), which
     // opens the dataset once and threads it in.
-    let (key_col, opp_col) = endpoint_columns(direction);
+    let probes = endpoint_probes(direction);
 
     let max = max_hops.unwrap_or(min_hops.max(1));
     // Cross-type edges cannot chain (a Company is not a `WorksAt` source), so a
@@ -1287,30 +1388,38 @@ async fn execute_expand_indexed(
             })
             .collect();
 
-        let batches = crate::table_store::TableStore::scan_edges_by_endpoint(
-            &edge_ds, key_col, opp_col, &union_keys,
-        )
-        .await?;
-
-        // dense key -> dense neighbors (scan order; duplicates preserved, like CSR multi-edges).
+        // dense key -> dense neighbors (scan order; duplicates preserved, like
+        // CSR multi-edges). One probe per orientation: Out/In do one pass;
+        // Both merges the src-keyed and dst-keyed scans into one map (the
+        // per-source `seen_dst` gate below dedups pairs present both ways).
         let mut neighbor_map: HashMap<u32, Vec<u32>> = HashMap::new();
-        for batch in &batches {
-            let keys = batch
-                .column_by_name(key_col)
-                .ok_or_else(|| OmniError::manifest(format!("edge batch missing '{}'", key_col)))?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", key_col)))?;
-            let opps = batch
-                .column_by_name(opp_col)
-                .ok_or_else(|| OmniError::manifest(format!("edge batch missing '{}'", opp_col)))?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", opp_col)))?;
-            for r in 0..batch.num_rows() {
-                let k = interner.get_or_insert(keys.value(r));
-                let o = interner.get_or_insert(opps.value(r));
-                neighbor_map.entry(k).or_default().push(o);
+        for &(key_col, opp_col) in probes {
+            let batches = crate::table_store::TableStore::scan_edges_by_endpoint(
+                &edge_ds, key_col, opp_col, &union_keys,
+            )
+            .await?;
+            for batch in &batches {
+                let keys = batch
+                    .column_by_name(key_col)
+                    .ok_or_else(|| {
+                        OmniError::manifest(format!("edge batch missing '{}'", key_col))
+                    })?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", key_col)))?;
+                let opps = batch
+                    .column_by_name(opp_col)
+                    .ok_or_else(|| {
+                        OmniError::manifest(format!("edge batch missing '{}'", opp_col))
+                    })?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", opp_col)))?;
+                for r in 0..batch.num_rows() {
+                    let k = interner.get_or_insert(keys.value(r));
+                    let o = interner.get_or_insert(opps.value(r));
+                    neighbor_map.entry(k).or_default().push(o);
+                }
             }
         }
 
@@ -1463,6 +1572,8 @@ async fn execute_expand_csr(
     let (src_type_name, dst_type_name) = match direction {
         Direction::Out => (&edge_def.from_type, &edge_def.to_type),
         Direction::In => (&edge_def.to_type, &edge_def.from_type),
+        // Both requires from_type == to_type (typecheck T22).
+        Direction::Both => (&edge_def.from_type, &edge_def.from_type),
     };
 
     let src_type_idx = graph_index
@@ -1473,10 +1584,20 @@ async fn execute_expand_csr(
         .ok_or_else(|| OmniError::manifest(format!("no type index for '{}'", dst_type_name)))?;
 
     let adj = match direction {
-        Direction::Out => graph_index.csr(edge_type),
+        Direction::Out | Direction::Both => graph_index.csr(edge_type),
         Direction::In => graph_index.csc(edge_type),
     }
     .ok_or_else(|| OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type)))?;
+    // Undirected: additionally walk incoming edges (CSC); the BFS gates below
+    // dedup pairs that exist in both directions and self-loops.
+    let adj_rev = match direction {
+        Direction::Both => Some(
+            graph_index
+                .csc(edge_type)
+                .ok_or_else(|| OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type)))?,
+        ),
+        _ => None,
+    };
 
     let max = max_hops.unwrap_or(min_hops.max(1));
 
@@ -1510,7 +1631,8 @@ async fn execute_expand_csr(
         for hop in 1..=max {
             let mut next_frontier = Vec::new();
             for &node in &frontier {
-                for &neighbor in adj.neighbors(node) {
+                let rev: &[u32] = adj_rev.map(|a| a.neighbors(node)).unwrap_or(&[]);
+                for &neighbor in adj.neighbors(node).iter().chain(rev) {
                     if !same_type || visited.insert(neighbor) {
                         next_frontier.push(neighbor);
                         if hop >= min_hops && seen_dst_dense.insert(neighbor) {
@@ -1583,7 +1705,7 @@ async fn hydrate_nodes(
     }
 
     let table_key = format!("node:{}", type_name);
-    let ds = snapshot.open(&table_key).await?;
+    let ds = snapshot.open_dataset(&table_key).await?;
 
     // `id IN (ids)` AND any pushable destination filters, as a structured Expr.
     let id_list: Vec<datafusion::prelude::Expr> = ids.iter().map(|id| lit(id.clone())).collect();
@@ -1677,13 +1799,22 @@ fn try_bulk_anti_join_mask(
     let edge_def = catalog.edge_types.get(edge_type.as_str())?;
 
     let src_type_name = match direction {
-        Direction::Out => &edge_def.from_type,
+        // Both grouped with Out: the primary adjacency below is `csr`, keyed
+        // in from_type's dense namespace (equal to to_type under T22, but the
+        // grouping must match `adj` so a future T22 relaxation cannot split
+        // them silently).
+        Direction::Out | Direction::Both => &edge_def.from_type,
         Direction::In => &edge_def.to_type,
     };
     let adj = match direction {
-        Direction::Out => gi.csr(edge_type),
+        Direction::Out | Direction::Both => gi.csr(edge_type),
         Direction::In => gi.csc(edge_type),
     }?;
+    // Undirected anti-join: "no edge in EITHER direction".
+    let adj_rev = match direction {
+        Direction::Both => Some(gi.csc(edge_type)?),
+        _ => None,
+    };
     let type_idx = gi.type_index(src_type_name)?;
 
     let id_col_name = format!("{}.id", outer_var);
@@ -1696,7 +1827,10 @@ fn try_bulk_anti_join_mask(
         .map(|i| {
             let id = outer_ids.value(i);
             match type_idx.to_dense(id) {
-                Some(dense) => !adj.has_neighbors(dense),
+                Some(dense) => {
+                    !adj.has_neighbors(dense)
+                        && !adj_rev.map(|a| a.has_neighbors(dense)).unwrap_or(false)
+                }
                 None => true, // not in graph index = no edges = keep
             }
         })
@@ -1828,7 +1962,7 @@ async fn execute_node_scan(
     search_mode: &SearchMode,
 ) -> Result<RecordBatch> {
     let table_key = format!("node:{}", type_name);
-    let ds = snapshot.open(&table_key).await?;
+    let ds = snapshot.open_dataset(&table_key).await?;
 
     let node_type = &catalog.node_types[type_name];
 
@@ -1866,6 +2000,18 @@ async fn execute_node_scan(
             // Apply the structured IR filter via Lance's Expr pushdown.
             if let Some(ref expr) = filter_expr {
                 scanner.filter_expr(expr.clone());
+                // The filter must run BEFORE any ANN/FTS search on this
+                // scanner. Lance defaults to prefilter=false, which applies
+                // the filter to the search's top-k results — "you may get
+                // back fewer results than you ask for (or none at all)"
+                // (lance scanner.rs) — i.e. `limit k` would mean top-k of
+                // the whole table, silently starved by a selective filter.
+                // One flag governs both the vector and FTS sources, and it
+                // is unused by plain scans, so setting it whenever a filter
+                // is present is safe. Prefiltering also re-enables scalar-
+                // index acceleration for the predicate (Lance gates
+                // use_scalar_index on prefilter when a nearest is present).
+                scanner.prefilter(true);
             }
 
             // Apply FTS queries from hoisted search filters (search/fuzzy/match_text in match clause)
@@ -2149,9 +2295,13 @@ pub(super) fn ir_expr_to_expr(
     params: &ParamMap,
     target: Option<&arrow_schema::DataType>,
 ) -> Option<datafusion::prelude::Expr> {
-    use datafusion::prelude::col;
+    use datafusion::prelude::ident;
     match expr {
-        IRExpr::PropAccess { property, .. } => Some(col(property)),
+        // #283: `ident()` preserves the identifier's case. `col()` would route
+        // through SQL identifier normalization and lowercase an unquoted
+        // camelCase column (`repoName` → `reponame`), which then fails to
+        // resolve against the case-sensitive Lance/Arrow schema.
+        IRExpr::PropAccess { property, .. } => Some(ident(property)),
         IRExpr::Literal(l) => literal_to_expr_coerced(l, target),
         IRExpr::Param(name) => params
             .get(name)
@@ -2457,6 +2607,107 @@ mod expand_chooser_tests {
 }
 
 #[cfg(test)]
+mod referenced_edge_types_tests {
+    use super::*;
+
+    fn node_scan(var: &str, ty: &str) -> IROp {
+        IROp::NodeScan {
+            variable: var.to_string(),
+            type_name: ty.to_string(),
+            filters: Vec::new(),
+        }
+    }
+
+    fn expand(edge: &str) -> IROp {
+        IROp::Expand {
+            src_var: "a".into(),
+            dst_var: "b".into(),
+            edge_type: edge.to_string(),
+            direction: Direction::Out,
+            dst_type: "X".into(),
+            min_hops: 1,
+            max_hops: Some(1),
+            dst_filters: Vec::new(),
+        }
+    }
+
+    fn names(pipeline: &[IROp]) -> Vec<String> {
+        let mut set = std::collections::BTreeSet::new();
+        collect_referenced_edge_names(pipeline, &mut set);
+        set.into_iter().collect()
+    }
+
+    #[test]
+    fn collects_a_single_expand_edge() {
+        assert_eq!(
+            names(&[node_scan("x", "ExternalID"), expand("identifiesPerson")]),
+            vec!["identifiesPerson".to_string()]
+        );
+    }
+
+    #[test]
+    fn ignores_non_traversal_ops_and_dedups() {
+        // A pipeline that touches one edge twice references exactly that one edge —
+        // never the whole catalog (the cross-edge-join hang this scoping fixes).
+        let pipeline = vec![
+            node_scan("x", "ExternalID"),
+            expand("identifiesPerson"),
+            IROp::Filter(IRFilter {
+                left: IRExpr::PropAccess {
+                    variable: "p".into(),
+                    property: "name".into(),
+                },
+                op: omnigraph_compiler::query::ast::CompOp::Eq,
+                right: IRExpr::Literal(Literal::String("a".into())),
+            }),
+            expand("identifiesPerson"),
+        ];
+        assert_eq!(names(&pipeline), vec!["identifiesPerson".to_string()]);
+    }
+
+    #[test]
+    fn recurses_through_anti_join_inner_pipeline() {
+        // The bulk anti-join fast path consumes the CSR for the inner Expand's
+        // edge, so its edge type must be in scope even though it is nested.
+        let pipeline = vec![
+            node_scan("p", "Person"),
+            expand("knows"),
+            IROp::AntiJoin {
+                outer_var: "p".into(),
+                inner: vec![expand("worksAt")],
+            },
+        ];
+        assert_eq!(
+            names(&pipeline),
+            vec!["knows".to_string(), "worksAt".to_string()]
+        );
+    }
+
+    #[test]
+    fn recurses_through_nested_anti_joins() {
+        let pipeline = vec![IROp::AntiJoin {
+            outer_var: "p".into(),
+            inner: vec![IROp::AntiJoin {
+                outer_var: "c".into(),
+                inner: vec![expand("deepEdge")],
+            }],
+        }];
+        assert_eq!(names(&pipeline), vec!["deepEdge".to_string()]);
+    }
+
+    #[test]
+    fn anti_join_with_no_inner_expand_references_no_edges() {
+        // A predicate-only anti-join never asks the handle for an index, so the
+        // empty set is correct — no whole-graph build is realized.
+        let pipeline = vec![IROp::AntiJoin {
+            outer_var: "p".into(),
+            inner: vec![node_scan("c", "Company")],
+        }];
+        assert!(names(&pipeline).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod literal_lowering_tests {
     use super::*;
     use datafusion::prelude::Expr;
@@ -2654,6 +2905,63 @@ mod literal_lowering_tests {
         assert!(
             binary_has_int32_literal(&expr),
             "reversed-operand literal must coerce to the Int32 column type, got {expr:?}"
+        );
+    }
+
+    // Name of the left operand's column in a binary comparison `col OP lit`.
+    fn binary_left_column_name(e: &Expr) -> Option<String> {
+        match e {
+            Expr::BinaryExpr(b) => match b.left.as_ref() {
+                Expr::Column(c) => Some(c.name.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    // #283: a camelCase property must reach the scan as its exact column name,
+    // not a SQL-normalized (lowercased) one. `col()` lowercases unquoted
+    // identifiers; the pushed-down column ref must stay `repoName`.
+    #[test]
+    fn ir_filter_preserves_camelcase_column_name() {
+        use arrow_schema::{DataType, Field};
+        let schema = arrow_schema::Schema::new(vec![Field::new("repoName", DataType::Utf8, true)]);
+        let filter = IRFilter {
+            left: IRExpr::PropAccess {
+                variable: "d".into(),
+                property: "repoName".into(),
+            },
+            op: CompOp::Eq,
+            right: IRExpr::Literal(Literal::String("acme".into())),
+        };
+        let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
+        assert_eq!(
+            binary_left_column_name(&expr).as_deref(),
+            Some("repoName"),
+            "camelCase column must be preserved (not lowercased to `reponame`), got {expr:?}"
+        );
+    }
+
+    // Index preservation: a camelCase numeric column still coerces its literal
+    // (so the scalar BTREE stays eligible) — the col→ident fix must not disturb
+    // the coercion path (which resolves the column type via field_with_name).
+    #[test]
+    fn ir_filter_coerces_literal_for_camelcase_int_column() {
+        use arrow_schema::{DataType, Field};
+        let schema =
+            arrow_schema::Schema::new(vec![Field::new("itemCount", DataType::Int32, true)]);
+        let filter = IRFilter {
+            left: IRExpr::PropAccess {
+                variable: "m".into(),
+                property: "itemCount".into(),
+            },
+            op: CompOp::Eq,
+            right: IRExpr::Literal(Literal::Integer(2)),
+        };
+        let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
+        assert!(
+            binary_has_int32_literal(&expr),
+            "camelCase int column must keep its coerced Int32 literal (BTREE-eligible), got {expr:?}"
         );
     }
 }

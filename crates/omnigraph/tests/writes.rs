@@ -1,13 +1,17 @@
-//! Tests for the direct-publish write path: mutations and loads write
-//! directly to target tables and commit once via the publisher's
-//! `expected_table_versions` CAS. (History: this replaced the removed Run
+//! Tests for the direct-publish write path. Mutations and loads capture one
+//! branch-wide authority token, prepare exact per-table transactions, then
+//! acquire the root-shared schema → branch → sorted-table gates, revalidate,
+//! arm schema-v3 recovery, commit the table effects, and publish once under the
+//! same exact-head/table precondition. (History: this replaced the removed Run
 //! state machine / `__run__` staging branches / RunRecord — MR-771.)
 //!
 //! What this file covers:
 //! - No `__run__*` branches are created by load or mutate.
 //! - Cancellation of a mutation future leaves no graph-level state.
-//! - Concurrent non-strict inserts/merges rebase under the per-table queue;
-//!   strict updates/deletes surface `ExpectedVersionMismatch` on stale state.
+//! - A pre-effect branch-authority change makes an insert-only mutation or
+//!   Append/Merge load discard and fully reprepare with a bounded retry; strict
+//!   Update/Delete/Overwrite surfaces `ReadSetChanged`. Post-effect failures
+//!   require recovery.
 //! - Failed mutations and loads leave the target unchanged.
 //! - Multi-statement mutations are atomic (one commit per query).
 //! - actor_id propagates through to the commit graph.
@@ -15,6 +19,7 @@
 mod helpers;
 
 use arrow_array::Array;
+use lance::Dataset;
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
@@ -241,11 +246,12 @@ async fn partial_failure_leaves_target_queryable_and_unblocks_next_mutation() {
     assert_eq!(frank.num_rows(), 1, "Frank must be visible after publish");
 }
 
-/// Stale non-strict writers rebase to the live manifest pin under the
-/// per-table queue instead of folding raw drift or returning a false 409.
-/// Strict update/delete semantics are covered by the consistency/server tests.
+/// Stale non-strict writers discard and reprepare their whole logical attempt
+/// from the live branch authority instead of rebasing an already-validated
+/// staged transaction or returning a false 409. Strict update/delete semantics
+/// are covered by the consistency/server tests.
 #[tokio::test]
-async fn stale_non_strict_insert_rebases_to_live_manifest_pin() {
+async fn stale_non_strict_insert_reprepares_from_live_branch_state() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_string_lossy().into_owned();
 
@@ -275,9 +281,10 @@ async fn stale_non_strict_insert_rebases_to_live_manifest_pin() {
     }
 
     // Writer B's coordinator is still at the pre-A snapshot, but Insert is
-    // non-strict: commit_all re-reads the live manifest pin under the queue,
-    // verifies Lance HEAD equals that pin, and then lets Lance rebase the
-    // staged append.
+    // retryable: the RFC-022 adapter notices the authority change under the
+    // branch gate, discards B's prepared/staged attempt, and reruns the full
+    // operation from A's committed state. Lance never rebases a plan whose
+    // validation inputs are stale.
     db_b.mutate(
         "main",
         MUTATION_QUERIES,
@@ -504,6 +511,11 @@ query delete_two_persons($first: String, $second: String) {
     delete Person where name = $second
 }
 
+query delete_overlapping_persons($name: String, $threshold: I32) {
+    delete Person where name = $name
+    delete Person where age > $threshold
+}
+
 query update_age_by_name($name: String, $age: I32) {
     update Person set { age: $age } where name = $name
 }
@@ -554,10 +566,125 @@ async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
 }
 
+/// Overlapping delete predicates within one query must NOT double-count
+/// `affected_*`. Deletes stage (they no longer inline-commit), so both
+/// statements scan the same unchanged committed snapshot; counting each
+/// predicate independently over-reports when they overlap. The contract —
+/// matching the old inline path, where each delete committed before the next
+/// ran — is the DISTINCT count of rows removed (= what the combined
+/// `(p1) OR (p2)` staged delete actually removes).
+///
+/// Fixture: Alice(30), Bob(25), Charlie(35), Diana(28); Knows Alice→Bob,
+/// Alice→Charlie, Bob→Diana; WorksAt Alice→Acme, Bob→Globex. `name = "Alice"`
+/// ∪ `age > 29` = {Alice, Charlie} (2 distinct nodes); the combined cascade
+/// removes {Alice→Bob, Alice→Charlie, Alice→Acme} (3 distinct edges — Charlie
+/// adds none new). Buggy per-statement counting reports 3 nodes / 6 edges.
+#[tokio::test]
+async fn overlapping_delete_predicates_do_not_double_count_affected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let r = db
+        .mutate(
+            "main",
+            STAGED_QUERIES,
+            "delete_overlapping_persons",
+            &mixed_params(&[("$name", "Alice")], &[("$threshold", 29)]),
+        )
+        .await
+        .expect("delete-only mutation must succeed");
+
+    assert_eq!(
+        r.affected_nodes, 2,
+        "distinct nodes removed are {{Alice, Charlie}}; overlapping predicates must not double-count",
+    );
+    assert_eq!(
+        r.affected_edges, 3,
+        "distinct edges removed are {{Alice→Bob, Alice→Charlie, Alice→Acme}}; cascade must not double-count",
+    );
+
+    // The data is correct regardless of the count: Bob + Diana remain.
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        2,
+        "Bob and Diana remain"
+    );
+    assert_eq!(
+        count_rows(&db, "edge:Knows").await,
+        1,
+        "only Bob→Diana remains"
+    );
+    assert_eq!(
+        count_rows(&db, "edge:WorksAt").await,
+        1,
+        "only Bob→Globex remains",
+    );
+}
+
+/// The overlap-exclusion filter must use SQL `IS NOT TRUE`, not `NOT`: a prior
+/// delete predicate referencing a NULLable column must NOT drop a later
+/// statement's matching row just because that column is NULL (SQL UNKNOWN).
+/// With `NOT (age > 30)`, a row with NULL `age` makes the clause UNKNOWN and the
+/// row is filtered out of `deleted_ids` — skipping its cascade (orphaned edges),
+/// or, if it is the only match, leaving the node undeleted. This is a data bug,
+/// not just a miscount.
+///
+/// Data: Charlie (age 35), Zoe (age NULL); Knows Zoe→Charlie. The query deletes
+/// `age > 30` (Charlie) then `name = "Zoe"`. Zoe must still be deleted and her
+/// edge cascaded despite the prior `age > 30` evaluating to UNKNOWN for her.
+#[tokio::test]
+async fn delete_dedup_filter_does_not_drop_null_column_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = r#"
+node Person {
+    name: String @key
+    age: I32?
+}
+edge Knows: Person -> Person
+"#;
+    let data = r#"{"type":"Person","data":{"name":"Charlie","age":35}}
+{"type":"Person","data":{"name":"Zoe"}}
+{"edge":"Knows","from":"Zoe","to":"Charlie"}"#;
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let q = r#"
+query del_age_then_name($threshold: I32, $name: String) {
+    delete Person where age > $threshold
+    delete Person where name = $name
+}
+"#;
+    let r = db
+        .mutate(
+            "main",
+            q,
+            "del_age_then_name",
+            &mixed_params(&[("$name", "Zoe")], &[("$threshold", 30)]),
+        )
+        .await
+        .expect("delete-only mutation must succeed");
+
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        0,
+        "both Charlie (age>30) and Zoe (name=Zoe, NULL age) must be deleted",
+    );
+    assert_eq!(
+        count_rows(&db, "edge:Knows").await,
+        0,
+        "Zoe→Charlie must cascade — Zoe's NULL age must not skip her cascade",
+    );
+    assert_eq!(r.affected_nodes, 2, "Charlie + Zoe");
+    assert_eq!(r.affected_edges, 1, "Zoe→Charlie, counted once");
+}
+
 /// `insert Person 'X'; update Person where name='X' set age=...` — both
 /// ops produce content on `node:Person` and coalesce into one
 /// `stage_merge_insert` at end-of-query. The accumulator's last-write-wins
-/// dedupe (in `MutationStaging::finalize`) ensures the update's value
+/// dedupe (during `MutationStaging::stage_all`) ensures the update's value
 /// wins. Single Lance commit per table per query.
 #[tokio::test]
 async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
@@ -581,7 +708,7 @@ async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
     assert_eq!(result.affected_nodes, 2, "1 insert + 1 update reported");
 
     // The end-state row carries the update value (last-write-wins via
-    // dedupe in finalize), proving the staged merge_insert ran with the
+    // end-of-query dedupe), proving the staged merge_insert ran with the
     // correct source dedupe. Read the underlying Person table directly
     // and assert age=99 for the row we just inserted+updated.
     let batches = read_table(&db, "node:Person").await;
@@ -613,7 +740,10 @@ async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
         "dedupe must keep the update's age value, not the insert's",
     );
 
-    // One-publish guarantee: manifest version advanced by exactly 1.
+    // One-publish guarantee: manifest version advanced by exactly 1. The graph
+    // commit (`graph_commit` + `graph_head` rows) rides the SAME publish CAS as
+    // the table-version rows (RFC-013 Phase 7), so one graph commit is exactly
+    // one manifest version bump.
     let post_version = version_main(&db).await.unwrap();
     assert_eq!(
         post_version,
@@ -659,7 +789,9 @@ async fn multiple_appends_to_same_edge_coalesce_to_one_append() {
     let edges_after = count_rows(&db, "edge:Knows").await;
     assert_eq!(edges_after, edges_before + 2);
 
-    // One manifest version bump for the two-edge query (atomic publish).
+    // One manifest version bump for the two-edge query (atomic publish): the
+    // graph commit rides the same publish CAS as the table-version rows
+    // (RFC-013 Phase 7).
     let post_version = version_main(&db).await.unwrap();
     assert_eq!(
         post_version,
@@ -690,6 +822,8 @@ async fn multi_statement_inserts_publish_exactly_once() {
     .await
     .unwrap();
 
+    // One manifest version bump: the graph commit rides the same publish CAS
+    // as the table-version rows (RFC-013 Phase 7).
     let post_version = version_main(&db).await.unwrap();
     assert_eq!(
         post_version,
@@ -808,9 +942,14 @@ async fn load_overwrite_with_bad_edge_reference_unblocks_next_load() {
     assert_eq!(count_rows(&db, "node:Person").await, pre_persons);
     assert_eq!(count_rows(&db, "edge:Knows").await, pre_edges);
 
+    // The good overwrite must be self-consistent: it replaces Person, so it also
+    // replaces every edge table that referenced the old Persons. WorksAt is in the
+    // batch (pointing the surviving Company at a new Person) so the retained
+    // WorksAt rows that named Alice/Bob don't strand against the new node image.
     let good = r#"{"type": "Person", "data": {"name": "Pat", "age": 55}}
 {"type": "Person", "data": {"name": "Quinn", "age": 56}}
 {"edge": "Knows", "from": "Pat", "to": "Quinn"}
+{"edge": "WorksAt", "from": "Pat", "to": "Acme"}
 "#;
     load_jsonl(&mut db, good, LoadMode::Overwrite)
         .await
@@ -940,7 +1079,7 @@ edge WorksAt: Person -> Company @card(0..1)
 /// `scan_with_pending`, the second update sees the stale committed value
 /// (the first update's row still appears in the Lance scan because the
 /// pending side hasn't committed), the predicate matches it, and the
-/// dedupe-last-wins step at finalize ends up applying the second update
+/// end-of-query dedupe-last-wins step ends up applying the second update
 /// to a row whose pending value should have shielded it.
 ///
 /// Concretely: Alice starts at age=30 in TEST_DATA. Op-1 sets Alice to
@@ -1005,6 +1144,8 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value(
         "chained-update final value must reflect the second update applied to op-1's pending value"
     );
 
+    // One manifest version bump: the graph commit rides the same publish CAS
+    // as the table-version rows (RFC-013 Phase 7).
     let post_version = version_main(&db).await.unwrap();
     assert_eq!(
         post_version,
@@ -1043,6 +1184,9 @@ async fn multi_statement_delete_on_same_node_table() {
         pre_persons - 2,
         "both deletes must land",
     );
+    // One manifest version bump: the graph commit (delete-only queries record
+    // one too) rides the same publish CAS as the table-version rows
+    // (RFC-013 Phase 7).
     let post_version = version_main(&db).await.unwrap();
     assert_eq!(
         post_version,
@@ -1219,7 +1363,7 @@ edge WorksAt: Person -> Company @card(0..1)
 }
 
 /// A Merge load whose input has TWO rows with the same edge id must be
-/// deduped at cardinality-count time, not just at finalize. Without
+/// deduped at cardinality-count time, not just during end-of-query staging. Without
 /// dedup, two pending rows count twice → spurious `@card` violation.
 /// With dedup (last-occurrence-wins, mirroring
 /// `dedupe_merge_batches_by_id`), the pending side counts once.
@@ -1254,7 +1398,7 @@ edge WorksAt: Person -> Company @card(0..1)
         .unwrap();
 
     // Merge load with the SAME edge id twice — the second row supersedes
-    // the first in the finalize-time dedupe. If pending-counting doesn't
+    // the first in the end-of-query dedupe. If pending-counting doesn't
     // dedupe, Alice has 2 pending edges → @card(0..1) trips → load
     // fails. With dedupe, Alice has 1 → load succeeds.
     let dup_data = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"id": "w1"}}
@@ -1269,114 +1413,13 @@ edge WorksAt: Person -> Company @card(0..1)
     assert_eq!(count_rows(&db, "edge:WorksAt").await, 1);
 }
 
-/// `scan_with_pending` must reject a call where `key_column` is
-/// requested but the projection omits that column. Without the
-/// up-front check, the helper silently degraded to union semantics —
-/// letting a chained-update bug slip through unnoticed. This test
-/// verifies the contract is enforced at the API boundary.
+/// A blob-table insert followed by a non-blob update must remain one
+/// full-schema merge stream. The update reads the just-inserted pending row,
+/// copies its logical blob column through, and replaces the pending row under
+/// the existing last-write-wins shadow semantics. This used to produce a
+/// partial update batch and fail schema validation at the second op.
 #[tokio::test]
-async fn scan_with_pending_rejects_key_column_missing_from_projection() {
-    use arrow_array::{RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
-    use omnigraph::table_store::TableStore;
-    use std::sync::Arc;
-
-    let dir = tempfile::tempdir().unwrap();
-    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("note", DataType::Utf8, true),
-    ]));
-    let seed = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(vec!["a", "b"])) as _,
-            Arc::new(StringArray::from(vec![Some("seed-a"), Some("seed-b")])) as _,
-        ],
-    )
-    .unwrap();
-    let ds = TableStore::write_dataset(&uri, seed).await.unwrap();
-
-    let pending = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(vec!["a"])) as _,
-            Arc::new(StringArray::from(vec![Some("pending-a")])) as _,
-        ],
-    )
-    .unwrap();
-
-    // Bad call: key_column = "id" but projection doesn't include "id".
-    // Pre-fix this silently disabled merge-shadowing and returned both
-    // committed "a" and pending "a" rows. Now it must error.
-    let err = store
-        .scan_with_pending(
-            &ds,
-            std::slice::from_ref(&pending),
-            None,
-            Some(&["note"]),
-            None,
-            Some("id"),
-        )
-        .await
-        .expect_err("scan_with_pending must reject merge-shadow with missing key in projection");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("key_column 'id'") && msg.contains("must appear in projection"),
-        "unexpected error: {msg}"
-    );
-
-    // Good call: projection includes the key column. Shadow works:
-    // pending row 'a' shadows committed 'a', so the result has only
-    // committed 'b' + pending 'a'.
-    let batches = store
-        .scan_with_pending(
-            &ds,
-            std::slice::from_ref(&pending),
-            None,
-            Some(&["id", "note"]),
-            None,
-            Some("id"),
-        )
-        .await
-        .expect("projection containing key_column must succeed");
-    let mut ids: Vec<String> = Vec::new();
-    for b in &batches {
-        let arr = b
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-            .unwrap();
-        for i in 0..arr.len() {
-            ids.push(arr.value(i).to_string());
-        }
-    }
-    ids.sort();
-    assert_eq!(
-        ids,
-        vec!["a", "b"],
-        "merge-shadow should drop committed 'a' and surface pending 'a' + committed 'b'"
-    );
-}
-
-/// `PendingTable.schema` is captured from the first `append_batch` call
-/// and never updated. On a blob-bearing table, an `insert` produces a
-/// full-schema batch (blob columns included) and an `update` that
-/// doesn't assign every blob produces a subset-schema batch. Mixed in
-/// one query, the second `append_batch` would silently push an
-/// incompatible batch — the mismatch surfaced eventually at
-/// `concat_batches`/MemTable construction inside finalize, but the
-/// failure point was distant from the offending op.
-///
-/// `append_batch` validates the new batch's schema against the existing
-/// accumulator's schema and returns a typed error directing the caller
-/// to split the mutation. The error fires at the second op (the
-/// update), not at end-of-query.
-#[tokio::test]
-async fn append_batch_rejects_mismatched_schema_in_blob_table_at_offending_op() {
+async fn blob_table_insert_then_non_blob_update_preserves_full_schema() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
     const BLOB_SCHEMA: &str = r#"
@@ -1399,10 +1442,9 @@ query insert_then_update_note(
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
-    // Seed with a Document so the update has something to match (the
-    // mid-query case is the chained-update scenario where the update's
-    // predicate matches the just-inserted row, exercising the in-memory
-    // pending union).
+    // Keep one committed blob row as well as the just-inserted pending row so
+    // the table has the real blob-v2 physical representation while this query
+    // exercises the pending union.
     load_jsonl(
         &mut db,
         r#"{"type":"Document","data":{"title":"seed","content":"base64:AQID"}}"#,
@@ -1411,7 +1453,7 @@ query insert_then_update_note(
     .await
     .unwrap();
 
-    let err = db
+    let result = db
         .mutate(
             "main",
             BLOB_QUERIES,
@@ -1423,36 +1465,35 @@ query insert_then_update_note(
             ]),
         )
         .await
-        .expect_err("blob-table mixed insert+update with non-fully-assigned blob must error early");
-    let OmniError::Manifest(manifest_err) = err else {
-        panic!("expected Manifest error, got {err:?}");
-    };
-    assert!(
-        manifest_err.message.contains("mismatched schemas")
-            && manifest_err.message.contains("Split the mutation"),
-        "error must direct user to split: {}",
-        manifest_err.message,
+        .expect("blob-table insert + non-blob update must share a full-schema merge batch");
+    assert_eq!(
+        result.affected_nodes, 2,
+        "one insert plus one pending-row update"
     );
 
-    // Confirm the manifest didn't advance — early error must be
-    // before any commit.
+    let blob = db
+        .read_blob("Document", "letter", "content")
+        .await
+        .expect("inserted blob must remain readable after the update");
+    assert_eq!(&blob.read().await.unwrap()[..], &[4, 5, 6]);
+
     let qr = db
         .query(
             ReadTarget::branch("main"),
             r#"query get_doc($title: String) {
                 match { $d: Document { title: $title } }
-                return { $d.title }
+                return { $d.title, $d.note }
             }"#,
             "get_doc",
             &params(&[("$title", "letter")]),
         )
         .await
         .unwrap();
-    assert_eq!(
-        qr.num_rows(),
-        0,
-        "letter must not be visible after early error"
-    );
+    assert_eq!(qr.num_rows(), 1);
+    let json = qr.to_sdk_json();
+    let row = json.as_array().unwrap().first().unwrap();
+    assert_eq!(row["d.title"], "letter");
+    assert_eq!(row["d.note"], "draft 1");
 }
 
 /// MR-920 regression: two sequential `update T set {f:v} where x=y`
@@ -1645,4 +1686,318 @@ async fn branch_cascade_delete_forks_node_and_edges_under_held_queues() {
         main_people,
         "main must be untouched by the branch delete"
     );
+}
+
+// #283: a mutation predicate (`where camelField = ...`) on a camelCase column
+// must execute, not fail at the Lance scan with "No field named ...". Covers
+// both `update` (committed scan via scan_with_pending) and `delete`
+// (stage_delete), which share the same emitted SQL filter string.
+const CC_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    repoName: String @index
+    status: String?
+}
+"#;
+const CC_DATA: &str = r#"{"type":"Doc","data":{"slug":"d1","repoName":"acme","status":"open"}}
+{"type":"Doc","data":{"slug":"d2","repoName":"globex","status":"open"}}"#;
+
+#[tokio::test]
+async fn camelcase_mutation_predicate_updates_and_deletes() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, CC_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let m = r#"
+query set_status($repo: String, $st: String) { update Doc set { status: $st } where repoName = $repo }
+query del($repo: String) { delete Doc where repoName = $repo }
+"#;
+
+    let upd = db
+        .mutate(
+            "main",
+            m,
+            "set_status",
+            &params(&[("$repo", "acme"), ("$st", "closed")]),
+        )
+        .await
+        .expect("update with a camelCase predicate must execute");
+    assert_eq!(upd.affected_nodes, 1, "exactly the acme Doc should update");
+
+    let del = db
+        .mutate("main", m, "del", &params(&[("$repo", "globex")]))
+        .await
+        .expect("delete with a camelCase predicate must execute");
+    assert_eq!(
+        del.affected_nodes, 1,
+        "exactly the globex Doc should delete"
+    );
+
+    assert_eq!(
+        count_rows(&db, "node:Doc").await,
+        1,
+        "one Doc (acme) should remain"
+    );
+}
+
+// #283 (pending side): a chained mutation whose 2nd op filters a camelCase
+// column must read op-1's staged rows through the pending DataFusion `MemTable`
+// (`SELECT … WHERE {filter}` via ctx.sql), which lowercases unquoted idents.
+// This is the path the single update/delete above does NOT exercise.
+#[tokio::test]
+async fn camelcase_chained_mutation_reads_pending_by_camelcase() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, CC_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    // op-1 stages a status change to the acme Doc; op-2 re-filters the same
+    // camelCase column, so it must match op-1's pending row.
+    let m = r#"
+query chain($repo: String) {
+    update Doc set { status: "stage1" } where repoName = $repo
+    update Doc set { status: "stage2" } where repoName = $repo
+}
+"#;
+    let r = db
+        .mutate("main", m, "chain", &params(&[("$repo", "acme")]))
+        .await
+        .expect(
+            "chained camelCase mutation must read the pending row, not fail at the MemTable SELECT",
+        );
+    assert_eq!(
+        r.affected_nodes, 2,
+        "both ops should touch the acme Doc (read-your-writes)"
+    );
+}
+
+/// A zero-row cascade delete must not advance an edge table's Lance HEAD past
+/// its manifest version. A `delete <Node>` cascades a delete into every incident
+/// edge type (`exec/mutation.rs`). The original bug this guards against: the old
+/// inline `delete_where` (`Dataset::delete`) advanced Lance HEAD **even when zero
+/// edges matched**, while the cascade recorded the new version in the manifest
+/// only `if deleted_rows > 0`. So deleting a node with no incident edges advanced
+/// `edge:Knows` Lance HEAD while the manifest stayed behind — a `HEAD > manifest`
+/// drift that then tripped the next strict write's `ExpectedVersionMismatch`, and
+/// `repair` refused (delete-class drift), wedging the graph.
+///
+/// This pins the invariant directly: after any node delete, every edge table's
+/// manifest version must equal its on-disk Lance HEAD — no write may advance HEAD
+/// past the manifest (invariant 2 / the deny-list). Now GREEN: `delete` is staged
+/// (MR-A / iss-950, via Lance 7.0's `DeleteBuilder::execute_uncommitted`), so a
+/// 0-row delete commits no Lance version at all — correct by construction.
+#[tokio::test]
+async fn node_delete_with_no_incident_edges_leaves_no_edge_table_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let root = dir.path().to_str().unwrap().to_string();
+
+    // A person with NO Knows edges. Deleting it cascades a 0-row delete
+    // into `edge:Knows` (the cascade runs for every incident edge type).
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Loner")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &params(&[("$name", "Loner")]),
+    )
+    .await
+    .expect("the first delete itself succeeds — it leaves the drift for the NEXT write");
+
+    // The invariant: edge:Knows manifest version == its on-disk Lance HEAD.
+    let snap = snapshot_main(&db).await.unwrap();
+    let entry = snap
+        .entry("edge:Knows")
+        .expect("edge:Knows must be in the manifest");
+    let full = format!("{}/{}", root.trim_end_matches('/'), entry.table_path);
+    let head = Dataset::open(&full).await.unwrap().version().version;
+    assert_eq!(
+        entry.table_version, head,
+        "a node delete matching no edges advanced edge:Knows Lance HEAD to v{head} but the \
+         manifest still records v{} — HEAD>manifest drift from a 0-row cascade delete. A staged \
+         0-row delete must commit no Lance version at all (MR-A); this drift means that \
+         regressed.",
+        entry.table_version,
+    );
+}
+
+/// RFC-013 PR2 #1b: the publisher folds the new `known_state` in-memory after a
+/// publish instead of re-scanning `__manifest`. That fold MUST be byte-identical
+/// to a fresh re-scan, or the warm coordinator silently desyncs. After a sequence
+/// of writes (insert, a second insert to the same table, then a delete that
+/// advances the table version), the in-memory coordinator holds the folded state;
+/// a freshly reopened graph rebuilds it via a real `read_manifest_state` scan.
+/// Counting `node:Person` off each resolves the table at the version each side
+/// recorded — a fold that set the wrong version (or path → open failure) makes the
+/// in-memory count diverge from the reopened one. Reopen is the scan side; the live
+/// `db` is the fold side.
+#[tokio::test]
+async fn post_publish_fold_matches_fresh_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "fold_a")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "fold_b")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "remove_person",
+        &mixed_params(&[("$name", "fold_a")], &[]),
+    )
+    .await
+    .unwrap();
+
+    // Fold side: count resolves the snapshot from the in-memory folded known_state.
+    let folded = count_rows(&db, "node:Person").await;
+
+    // Scan side: a fresh open rebuilds known_state via `read_manifest_state`.
+    let reopened = Omnigraph::open(uri).await.unwrap();
+    let scanned = count_rows(&reopened, "node:Person").await;
+
+    assert_eq!(
+        folded, scanned,
+        "post-publish fold diverged from a fresh re-scan (folded {folded} vs scanned {scanned})"
+    );
+}
+
+const FIND_PERSON_QUERY: &str = r#"
+query find_person($name: String) {
+    match { $p: Person { name: $name } }
+    return { $p.name }
+}
+"#;
+
+/// Regression: iss-merge-rowid-overlap-corrupts-filtered-reads / lance#7444.
+///
+/// An update-style merge (same-key merge load) reuses the updated rows'
+/// stable row ids in the rewritten fragments while the superseded fragment
+/// keeps its full row-id sequence plus a deletion vector — overlapping
+/// cross-fragment id ranges, legal per the Lance row-id-lineage spec. A
+/// later delete punches a hole in that overlapping range; on unpatched
+/// Lance 7.0.0 `RowIdIndex::new` then fails any filtered scan that needs
+/// the id→address map ("all columns in a record batch must have the same
+/// length" in release, a "Wrong range" debug assert). Fixed upstream by
+/// lance#7480; consumed here via the vendored `lance-table` patch.
+#[tokio::test]
+async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    let seed: String = (1..=40)
+        .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
+        .collect();
+    load_jsonl(&mut db, &seed, LoadMode::Merge).await.unwrap();
+
+    // Same-key updates: Lance Operation::Update rewrites these 15 rows into
+    // new fragments that keep their original stable row ids (the overlap).
+    let updates: String = (1..=15)
+        .map(|i| {
+            format!(
+                "{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{}}}}}\n",
+                100 + i
+            )
+        })
+        .collect();
+    load_jsonl(&mut db, &updates, LoadMode::Merge)
+        .await
+        .unwrap();
+
+    // The delete adds a deletion vector, so the overlapping region no longer
+    // densely tiles its id range — the shape lance#7444 choked on.
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &mixed_params(&[("$name", "p20")], &[]),
+    )
+    .await
+    .unwrap();
+
+    // Filtered point lookups must still resolve: an updated row, an
+    // untouched row, and the deleted row (absent), each via the key filter.
+    for (name, expected) in [("p3", vec!["p3"]), ("p30", vec!["p30"]), ("p20", vec![])] {
+        let result = query_main(
+            &mut db,
+            FIND_PERSON_QUERY,
+            "find_person",
+            &mixed_params(&[("$name", name)], &[]),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("filtered read for {name} failed: {e}"));
+        let got = first_column_sorted(&result);
+        assert_eq!(got, expected, "filtered read for {name}");
+    }
+}
+
+/// Isolation control for the regression above: the same load/delete/filtered
+/// read walk WITHOUT same-key updates (append-only merges, disjoint keys)
+/// never produces overlapping row-id ranges and passes on unpatched Lance.
+/// If this one fails alongside the merge-update case, the defect is not the
+/// lance#7444 overlap shape.
+#[tokio::test]
+async fn filtered_read_after_append_and_delete_is_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    let seed: String = (1..=40)
+        .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
+        .collect();
+    load_jsonl(&mut db, &seed, LoadMode::Merge).await.unwrap();
+
+    // Disjoint keys: plain inserts, no fragment rewrite, no id reuse.
+    let more: String = (41..=55)
+        .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
+        .collect();
+    load_jsonl(&mut db, &more, LoadMode::Merge).await.unwrap();
+
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &mixed_params(&[("$name", "p20")], &[]),
+    )
+    .await
+    .unwrap();
+
+    for (name, expected) in [("p3", vec!["p3"]), ("p50", vec!["p50"]), ("p20", vec![])] {
+        let result = query_main(
+            &mut db,
+            FIND_PERSON_QUERY,
+            "find_person",
+            &mixed_params(&[("$name", name)], &[]),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("filtered read for {name} failed: {e}"));
+        let got = first_column_sorted(&result);
+        assert_eq!(got, expected, "filtered read for {name}");
+    }
 }

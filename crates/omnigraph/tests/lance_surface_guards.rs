@@ -86,6 +86,27 @@ async fn lance_error_too_much_write_contention_variant_exists() {
     );
 }
 
+// --- Guard 1c: LanceError::DatasetAlreadyExists variant exists --------------
+//
+// `db/commit_graph.rs` and `db/recovery_audit.rs` create internal Lance tables
+// with a create-or-open idempotency fallback: a concurrent/prior create races,
+// and the `DatasetAlreadyExists` arm falls back to `Dataset::open`. They match
+// the typed variant, NOT the display string ("Dataset already exists: ..."),
+// which is not a Lance API contract. If Lance renames the variant the match
+// silently stops catching the race and a re-create errors instead of opening —
+// this guard turns red to force an update.
+
+#[tokio::test]
+async fn lance_error_dataset_already_exists_variant_exists() {
+    let err = lance::Error::dataset_already_exists("guard");
+    assert!(
+        matches!(err, lance::Error::DatasetAlreadyExists { .. }),
+        "Lance::Error::DatasetAlreadyExists variant missing or renamed; update the \
+         db/commit_graph.rs + db/recovery_audit.rs create-or-open fallbacks and \
+         this guard, then re-pin docs/dev/lance.md."
+    );
+}
+
 // --- Guard 2: ManifestLocation field shape ---------------------------------
 //
 // `db/manifest/metadata.rs:84-88` reads `.path`, `.size`, `.e_tag`,
@@ -257,12 +278,15 @@ async fn _compile_transaction_history_for_repair_signature() -> lance::Result<()
     Ok(())
 }
 
-// --- Guard 8: Dataset::delete returns DeleteResult { new_dataset, num_deleted_rows } ---
+// --- Guard 8: DeleteBuilder::execute_uncommitted returns
+//     UncommittedDelete { transaction, affected_rows, num_deleted_rows } ---
 //
-// `table_store.rs::delete_where` consumes both fields. When MR-A migrates
-// `delete_where` to two-phase via `DeleteBuilder::execute_uncommitted`, this
-// guard updates to pin the staged path. Compile-only.
-
+// `table_store.rs::stage_delete` uses the two-phase delete (lance#6658, Lance
+// 7.0): it reads `num_deleted_rows` (0 ⇒ no-op `None`) and stages `transaction`
+// WITHOUT committing, instead of the inline `Dataset::delete`. It must also
+// preserve `affected_rows` and pass it to `CommitBuilder::with_affected_rows`
+// through `StagedWrite`; dropping it disables Lance's row-level rebase metadata.
+// Compile-only.
 #[allow(
     dead_code,
     unreachable_code,
@@ -270,11 +294,75 @@ async fn _compile_transaction_history_for_repair_signature() -> lance::Result<()
     unused_mut,
     clippy::diverging_sub_expression
 )]
-async fn _compile_delete_result_field_shape() -> lance::Result<()> {
+async fn _compile_uncommitted_delete_field_shape() -> lance::Result<()> {
+    use lance::dataset::DeleteBuilder;
+    use lance_select::mask::RowAddrTreeMap;
+    let ds: Arc<Dataset> = unimplemented!();
+    let staged = DeleteBuilder::new(ds, "x = 1")
+        .execute_uncommitted()
+        .await?;
+    let _txn: lance::dataset::transaction::Transaction = staged.transaction;
+    let _num_deleted: u64 = staged.num_deleted_rows;
+    let _affected: Option<RowAddrTreeMap> = staged.affected_rows;
+    Ok(())
+}
+
+// --- Guard 8a: full-table vector indexing exposes uncommitted metadata -----
+//
+// EnsureIndices batches BTREE, FTS, and the current one-segment full-table
+// vector shape into one exact `Operation::CreateIndex`. This requires the
+// beta.21 builder to return complete public `IndexMetadata` without committing
+// HEAD. Compile-only: a Lance bump that removes or narrows the surface must
+// turn the compatibility smoke test red.
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_uncommitted_full_table_vector_index_shape() -> lance::Result<()> {
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+    use lance_table::format::IndexMetadata;
+
     let mut ds: Dataset = unimplemented!();
-    let result: DeleteResult = ds.delete("x = 1").await?;
-    let _new_dataset: Arc<Dataset> = result.new_dataset;
-    let _num_deleted: u64 = result.num_deleted_rows;
+    let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+    let metadata: IndexMetadata = ds
+        .create_index_builder(&["embedding"], IndexType::Vector, &params)
+        .replace(true)
+        .execute_uncommitted()
+        .await?;
+    let _transaction_shape = Operation::CreateIndex {
+        new_indices: vec![metadata],
+        removed_indices: Vec::new(),
+    };
+    Ok(())
+}
+
+// --- Guard 8b: MergeInsertJob::execute_uncommitted returns
+//     UncommittedMergeInsert { transaction, affected_rows, stats, inserted_rows_filter } ---
+//
+// `TableStore::stage_merge_insert` has the same staged commit contract as
+// delete: the Lance transaction and `affected_rows` metadata must travel
+// together into `commit_staged`.
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
+    use lance_select::mask::RowAddrTreeMap;
+    let ds: Arc<Dataset> = unimplemented!();
+    let source: Box<dyn arrow_array::RecordBatchReader + Send> = unimplemented!();
+    let job = MergeInsertBuilder::try_new(ds, vec!["x".to_string()])?.try_build()?;
+    let staged = job.execute_uncommitted(source).await?;
+    let _txn: lance::dataset::transaction::Transaction = staged.transaction;
+    let _affected: Option<RowAddrTreeMap> = staged.affected_rows;
+    let _stats = staged.stats;
+    let _inserted_rows_filter = staged.inserted_rows_filter;
     Ok(())
 }
 
@@ -283,16 +371,21 @@ async fn _compile_delete_result_field_shape() -> lance::Result<()> {
 // The branch-delete reconciler (`db/omnigraph/optimize.rs::reconcile_orphaned_branches`)
 // and the eager best-effort reclaim in `cleanup_deleted_branch_tables` call
 // `force_delete_branch` to drop orphaned branch refs. The single-authority
-// design relies on three facts pinned here:
+// design relies on five facts pinned here:
 //   1. plain `delete_branch` errors on a missing ref (so the design uses the
 //      force variant instead);
 //   2. `force_delete_branch` removes an existing (forked) branch — the orphan
 //      case, where a `tree/{branch}/` exists;
-//   3. `force_delete_branch` on a *fully-absent* branch (no tree dir) still
-//      errors on the local store, because `remove_dir_all`'s NotFound is not
-//      caught for Lance's native error variant. `TableStore::force_delete_branch`
-//      wraps this to be fully idempotent. Pin the raw quirk so a future Lance
-//      fix (which would let us simplify the wrapper) is noticed.
+//   3. `force_delete_branch` on a *fully-absent* branch (no tree dir) is
+//      idempotent. Beta.18 maps object-store absence to Lance `NotFound`, and
+//      branch cleanup now treats that as success. Pin the positive contract;
+//   4. a clone-only zombie (branch dataset present, BranchContents absent)
+//      blocks raw create and is reclaimed by `force_delete_branch`. Lance's
+//      create is explicitly two-phase, so this is the crash state OmniGraph's
+//      native branch-control wrapper must heal before retrying;
+//   5. a live slash-name path-child makes force delete remove an ancestor's
+//      BranchContents but intentionally retain its dataset files. OmniGraph's
+//      prefix-disjoint live-name invariant prevents this false-success shape.
 
 #[tokio::test]
 async fn force_delete_branch_semantics() {
@@ -317,31 +410,76 @@ async fn force_delete_branch_semantics() {
         "force_delete_branch should remove an existing branch ref"
     );
 
-    // (3) Quirk: force_delete on a fully-absent branch errors on the local
-    // store (worked around by TableStore::force_delete_branch).
+    // (3) Force delete is idempotent even when both the ref and tree are absent.
+    ds.force_delete_branch("never").await.unwrap();
+
+    // (4) Exact phase-1-only create state: create the shallow-cloned branch
+    // dataset, then remove only its authoritative BranchContents ref. This is
+    // the same fixture Lance's own dataset-versioning test uses for a zombie.
+    ds.create_branch("zombie", base, None).await.unwrap();
+    std::fs::remove_file(
+        std::path::Path::new(uri)
+            .join("_refs")
+            .join("branches")
+            .join("zombie.json"),
+    )
+    .unwrap();
     assert!(
-        ds.force_delete_branch("never").await.is_err(),
-        "force_delete_branch on a fully-absent branch no longer errors — \
-         TableStore::force_delete_branch's NotFound tolerance can be simplified."
+        !ds.list_branches().await.unwrap().contains_key("zombie"),
+        "BranchContents is the authority; the clone-only tree must not list as a branch"
+    );
+    assert!(
+        ds.create_branch("zombie", base, None).await.is_err(),
+        "the clone-only tree should block an unclassified raw create"
+    );
+    ds.force_delete_branch("zombie").await.unwrap();
+    assert!(
+        !std::path::Path::new(uri)
+            .join("tree")
+            .join("zombie")
+            .exists(),
+        "force_delete_branch must reclaim the clone-only tree"
+    );
+
+    // (5) Slash-separated names overlap physically. A path-child created from
+    // main is not a lineage descendant of its lexical ancestor, so raw force
+    // delete removes the ancestor ref but deliberately leaves its dataset
+    // files to avoid recursively deleting the child.
+    ds.create_branch("ancestor/child", base, None)
+        .await
+        .unwrap();
+    ds.create_branch("ancestor", base, None).await.unwrap();
+    ds.force_delete_branch("ancestor").await.unwrap();
+    assert!(
+        !ds.list_branches().await.unwrap().contains_key("ancestor"),
+        "raw force delete still removes authoritative ancestor metadata"
+    );
+    assert!(
+        std::path::Path::new(uri)
+            .join("tree")
+            .join("ancestor")
+            .join("_versions")
+            .exists(),
+        "Lance must retain ancestor dataset files while a physical path-child is live"
     );
 }
 
-// --- Guard 10: blob-column compaction is still broken in this Lance --------
+// --- Guard 10: blob-column compaction works in this Lance ------------------
 //
-// `db/omnigraph/optimize.rs` skips tables with blob columns while
-// `LANCE_SUPPORTS_BLOB_COMPACTION = false`: Lance `compact_files` forces
-// `BlobHandling::AllBinary`, and the blob-v2 struct decoder mis-counts columns
-// ("more fields in the schema than provided column indices"), failing even a
-// pristine uniform-V2_2 multi-fragment blob table. Reads are unaffected (they
-// use descriptor handling).
-//
-// WHEN THIS TEST TURNS RED (compact_files no longer errors), the Lance bug is
-// fixed: flip `LANCE_SUPPORTS_BLOB_COMPACTION` to true in optimize.rs, drop the
-// blob-skip branch + the `optimize_skips_blob_table_and_reports_skip`
-// skip assertions in maintenance.rs, and re-pin docs/dev/lance.md.
+// Historical: through Lance 7.0.0, `compact_files` forced
+// `BlobHandling::AllBinary` and the blob-v2 struct decoder mis-counted columns,
+// failing even a pristine uniform-V2_2 multi-fragment blob table; `optimize`
+// skipped blob-bearing tables behind `LANCE_SUPPORTS_BLOB_COMPACTION = false`.
+// Lance 8.0.0 shipped full blob-v2 compaction (upstream PR #7017; hardened by
+// #7618 in 9.0.0-beta.15 after a beta.13 regression), so the gate, the skip
+// branch, and the `BlobColumnsUnsupportedByLance` skip reason were removed at
+// the 9.0.0-beta.15 bump. This guard pins the POSITIVE behavior `optimize` now
+// relies on: a multi-fragment blob table compacts, preserving every row. If it
+// turns red on a future bump, blob compaction regressed — restore the skip
+// machinery from git history.
 
 #[tokio::test]
-async fn compact_files_still_fails_on_blob_columns() {
+async fn compact_files_succeeds_on_blob_columns() {
     use arrow_array::{LargeBinaryArray, StructArray};
 
     fn blob_batch(start: i32, n: i32) -> RecordBatch {
@@ -400,17 +538,24 @@ async fn compact_files_still_fails_on_blob_columns() {
         "guard needs a multi-fragment table to trigger a real compaction rewrite"
     );
 
-    let result = compact_files(&mut ds, CompactionOptions::default(), None).await;
-    let err = result.expect_err(
-        "compact_files unexpectedly SUCCEEDED on a blob table — the Lance blob-v2 \
-         compaction bug is fixed. Flip LANCE_SUPPORTS_BLOB_COMPACTION to true in \
-         db/omnigraph/optimize.rs, remove the blob-skip branch, and re-pin docs/dev/lance.md.",
-    );
+    let rows_before = ds.count_rows(None).await.unwrap();
+    let metrics = compact_files(&mut ds, CompactionOptions::default(), None)
+        .await
+        .expect(
+            "compact_files FAILED on a blob table — the Lance blob-v2 compaction \
+             fix (present since 8.0.0, hardened by lance#7618) regressed. If this \
+             is a Lance downgrade, restore the pre-9 blob-skip branch in \
+             db/omnigraph/optimize.rs (see git history + docs/dev/lance.md).",
+        );
     assert!(
-        err.to_string()
-            .contains("more fields in the schema than provided column indices"),
-        "blob compaction failed with an unexpected error (Lance internals may have \
-         shifted): {err}"
+        metrics.fragments_removed >= 2 && metrics.fragments_added >= 1,
+        "expected a real rewrite of the multi-fragment blob table, got {metrics:?}"
+    );
+    let ds = Dataset::open(uri).await.unwrap();
+    assert_eq!(
+        ds.count_rows(None).await.unwrap(),
+        rows_before,
+        "compaction must preserve every blob row"
     );
 }
 
@@ -680,7 +825,9 @@ async fn scalar_index_use_requires_matched_literal_type() {
         vec![
             Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
             Arc::new(Int32Array::from(vec![1, 5, 9, 13])),
-            Arc::new(arrow_array::Date32Array::from(vec![19000, 19723, 20000, 20500])),
+            Arc::new(arrow_array::Date32Array::from(vec![
+                19000, 19723, 20000, 20500,
+            ])),
         ],
     )
     .unwrap();
@@ -709,7 +856,17 @@ async fn scalar_index_use_requires_matched_literal_type() {
     // (label, filter, expect_index_used)
     let cases = [
         ("n32 = 5i32 (matched Int32)", col("n32").eq(lit(5i32)), true),
-        ("n32 = 5i64 (widened Int64)", col("n32").eq(lit(5i64)), false),
+        (
+            "n32 = 5i64 (widened Int64)",
+            col("n32").eq(lit(5i64)),
+            // 7.0.0: a width-mismatched literal blocked index pushdown (this
+            // pinned `false`). The v8 coercion fixes (lance#6935 et al.) now
+            // coerce Int64(5) -> Int32(5) BEFORE pushdown, so the BTREE is
+            // used. query.rs::literal_to_typed_expr remains load-bearing for
+            // producing exactly-typed literals; Lance now also rescues the
+            // widened case.
+            true,
+        ),
         (
             "d32 = Date32 (matched)",
             col("d32").eq(lit(ScalarValue::Date32(Some(19723)))),
@@ -733,12 +890,14 @@ async fn scalar_index_use_requires_matched_literal_type() {
         );
     }
 
-    // The widened case must show the index-defeating column CAST (the precise
-    // shape the fix avoids by coercing the literal to the column type).
+    // 7.0.0 planned the widened case as an index-defeating column-side CAST
+    // (`CAST(n32 AS Int64) = 5`); since the v8 coercion fixes the literal is
+    // coerced to the column type instead — pin the new mechanism: no column
+    // cast, literal narrowed to Int32.
     let widened = plan_str(&ds, col("n32").eq(lit(5i64))).await;
     assert!(
-        widened.contains("CAST(n32 AS Int64)"),
-        "expected a column-side cast in the widened plan, got:\n{widened}"
+        !widened.contains("CAST(n32") && widened.contains("Int32(5)"),
+        "expected a literal coerced to Int32 with no column-side cast, got:\n{widened}"
     );
 }
 
@@ -840,7 +999,10 @@ async fn skip_auto_cleanup_suppresses_version_gc() {
     async fn set_legacy_cleanup(ds: &mut Dataset) {
         let mut cfg = HashMap::new();
         cfg.insert("lance.auto_cleanup.interval".to_string(), "1".to_string());
-        cfg.insert("lance.auto_cleanup.older_than".to_string(), "0ms".to_string());
+        cfg.insert(
+            "lance.auto_cleanup.older_than".to_string(),
+            "0ms".to_string(),
+        );
         ds.update_config(cfg).await.unwrap();
     }
     fn row(i: i32) -> (Arc<Schema>, RecordBatch) {
@@ -990,4 +1152,191 @@ async fn unenforced_primary_key_is_immutable_once_set() {
          (got: {outcome:?}); immutability relaxed or moved off the commit path \
          — revisit migrate_v1_to_v2's field-guard and re-pin docs/dev/lance.md."
     );
+}
+
+// --- Guard 20: camelCase @index equality routes to the scalar index (#283) ----
+//
+// The #283 read-pushdown fix builds the filter column with datafusion `ident()`
+// (case-preserving) instead of `col()` (SQL identifier normalization, which
+// lowercases an unquoted name). The correctness tests in literal_filters.rs /
+// writes.rs prove the right rows come back, but a result-only assertion also
+// passes on a full-scan fallback — exactly the gap testing.md warns about. This
+// guard pins the *plan*: an equality on a camelCase BTREE column must compile to
+// a `ScalarIndexQuery` under the fix's expr shape, and must NOT under the old
+// `col()` shape (which lowercases `repoName` → a nonexistent `reponame`). A
+// regression that breaks camelCase index routing — or a revert to `col()` —
+// turns this red instead of silently degrading to a full scan.
+#[tokio::test]
+async fn camelcase_index_equality_routes_to_scalar_index() {
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{col, ident, lit};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("camelcase_index.lance");
+    let uri = uri.to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("repoName", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            Arc::new(StringArray::from(vec![
+                "acme", "globex", "initech", "umbrella",
+            ])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
+    ds.create_index_builder(
+        &["repoName"],
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+    )
+    .replace(true)
+    .await
+    .unwrap();
+
+    async fn plan_str(ds: &Dataset, filter: datafusion::prelude::Expr) -> lance::Result<String> {
+        let mut scanner = ds.scan();
+        scanner.filter_expr(filter);
+        let plan = scanner.create_plan().await?;
+        Ok(format!("{}", displayable(plan.as_ref()).indent(true)))
+    }
+
+    // The fix's shape: ident() preserves case → resolves `repoName` → index.
+    let used = plan_str(&ds, ident("repoName").eq(lit("acme")))
+        .await
+        .expect("ident(\"repoName\") must plan against the case-preserved schema");
+    assert!(
+        used.contains("ScalarIndexQuery"),
+        "camelCase @index equality must route to the scalar index (not full scan), got:\n{used}"
+    );
+
+    // The pre-fix shape: col() normalizes `repoName` → `reponame`, which does not
+    // exist in the case-sensitive schema, so planning fails. This is precisely
+    // why `col()` could never reach the index and surfaced the #283 runtime error
+    // — it could not silently full-scan past the index either.
+    let err = plan_str(&ds, col("repoName").eq(lit("acme"))).await;
+    assert!(
+        err.is_err(),
+        "col() lowercases repoName→reponame against a case-sensitive schema; \
+         planning must fail rather than resolve, confirming ident() is required \
+         for camelCase index routing. got plan:\n{err:?}"
+    );
+}
+
+// --- Guard: filtered scans tolerate merge_insert's overlapping row-id ranges
+//     (lance#7444, fixed by lance#7480; consumed via the vendored lance-table
+//     patch) -------------------------------------------------------------
+//
+// An update-style merge_insert over a fragment that was itself merge-written
+// reuses the updated rows' stable row ids in its rewritten fragments (row-id
+// lineage spec: updates preserve `_rowid`) while the superseded fragment keeps
+// its full id sequence plus a deletion vector — legal, overlapping
+// cross-fragment id ranges. A later delete leaves the overlap sparsely tiled;
+// unpatched lance-table 7.0.0's `RowIdIndex::new` asserted dense tiling and
+// failed any filtered read that builds the id→address map: "Wrong range"
+// debug assert, "all columns in a record batch must have the same length" (or
+// a silently-wrong batch) in release. Faithful transcription of lance#7444's
+// minimal repro: merge-seed → merge-update → delete → filter + with_row_id.
+// This guard turns red if a Lance bump regresses the fix, or if the vendored
+// patch is dropped before the pinned lance-table ships lance#7480.
+#[tokio::test]
+async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
+    use futures::TryStreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("slug", DataType::Utf8, false),
+        Field::new("title", DataType::Utf8, false),
+    ]));
+    let mk_batch = |slugs: Vec<String>, titles: Vec<String>| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(slugs)) as arrow_array::ArrayRef,
+                Arc::new(StringArray::from(titles)) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap()
+    };
+
+    // Empty dataset WITH stable row ids; both data writes are merge_inserts
+    // (merge-on-merge is lance#7444's trigger qualifier — a plain
+    // Dataset::write seed does not reproduce).
+    let empty = mk_batch(Vec::new(), Vec::new());
+    let reader = RecordBatchIterator::new(vec![Ok(empty)], schema.clone());
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
+
+    let merge = |ds: Dataset, batch: RecordBatch, schema: Arc<Schema>| async move {
+        let job = MergeInsertBuilder::try_new(Arc::new(ds), vec!["slug".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        let source = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let (ds, _stats) = job.execute_reader(source).await.unwrap();
+        (*ds).clone()
+    };
+
+    // Merge #1 seeds 40 rows; merge #2 rewrites 15 of them (keeping their
+    // stable ids — the overlap with the merge-written seed fragment).
+    let seed = mk_batch(
+        (1..=40).map(|i| format!("t{i}")).collect(),
+        (1..=40).map(|i| format!("r{i}")).collect(),
+    );
+    let ds = merge(ds, seed, schema.clone()).await;
+    let updates = mk_batch(
+        (1..=15).map(|i| format!("t{i}")).collect(),
+        (1..=15).map(|i| format!("e{i}")).collect(),
+    );
+    let ds = Arc::new(merge(ds, updates, schema.clone()).await);
+
+    // The delete's deletion vector makes the overlapping id region sparse.
+    let staged = lance::dataset::DeleteBuilder::new(ds.clone(), "slug = 't20'")
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    assert_eq!(staged.num_deleted_rows, 1, "expected exactly t20 deleted");
+    let ds = CommitBuilder::new(ds)
+        .execute(staged.transaction)
+        .await
+        .unwrap();
+
+    // filter + with_row_id forces the RowIdIndex build (a full scan does
+    // not). On the broken index this errors/panics; on the fixed one every
+    // live id resolves.
+    for (slug, expected) in [("t3", 1usize), ("t20", 0usize)] {
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        scan.filter(&format!("slug = '{slug}'")).unwrap();
+        let batches: Vec<RecordBatch> = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, expected, "filtered read for {slug}");
+    }
 }

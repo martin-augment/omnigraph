@@ -43,6 +43,9 @@ pub struct SnapshotTableOutput {
 pub struct SnapshotOutput {
     pub branch: String,
     pub manifest_version: u64,
+    /// The on-disk internal-schema (storage-format) version this graph's branch
+    /// is stamped at.
+    pub internal_schema_version: u32,
     pub tables: Vec<SnapshotTableOutput>,
 }
 
@@ -80,6 +83,12 @@ pub struct BranchMergeRequest {
     pub source: String,
     /// Target branch that will receive the merge. Defaults to `main`.
     pub target: Option<String>,
+    /// Delete the source branch after a successful merge. The deletion runs
+    /// under its own `branch_delete` policy check; a refusal or failure is
+    /// reported via `branch_deleted` / `branch_delete_error` on the response
+    /// and never fails the already-landed merge.
+    #[serde(default)]
+    pub delete_branch: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -116,6 +125,16 @@ pub struct BranchMergeOutput {
     pub target: String,
     pub outcome: BranchMergeOutcome,
     pub actor_id: Option<String>,
+    /// Result of the requested post-merge source-branch deletion. Absent when
+    /// `delete_branch` was not requested; `true` when the source branch was
+    /// deleted; `false` when the deletion was refused or failed (the merge
+    /// itself still succeeded — see `branch_delete_error`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_deleted: Option<bool>,
+    /// Why the requested source-branch deletion did not happen. Present iff
+    /// `branch_deleted` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_delete_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -401,8 +420,8 @@ pub struct QueryCatalogEntry {
     pub params: Vec<ParamDescriptor>,
 }
 
-/// Response for `GET /queries`: the `mcp.expose` subset of a graph's
-/// stored-query registry, each with typed parameters.
+/// Response for `GET /queries`: every stored query in a graph's
+/// registry, each with typed parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QueriesCatalogOutput {
     pub queries: Vec<QueryCatalogEntry>,
@@ -538,6 +557,8 @@ pub struct CommitListQuery {
 pub struct HealthOutput {
     pub status: String,
     pub version: String,
+    /// The internal-schema (storage-format) version this binary writes and reads.
+    pub internal_schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,
 }
@@ -572,6 +593,21 @@ pub struct ManifestConflictOutput {
     pub actual: u64,
 }
 
+/// Structured authority mismatch for an RFC-022 prepared write. Values are
+/// strings because members include optional graph commit ids and future
+/// authority tokens, not only numeric table versions.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReadSetConflictOutput {
+    pub member: String,
+    pub expected: Option<String>,
+    pub actual: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RecoveryRequiredOutput {
+    pub operation_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorOutput {
     pub error: String,
@@ -585,9 +621,20 @@ pub struct ErrorOutput {
     /// manifest is now at `actual`. Refresh and retry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_conflict: Option<ManifestConflictOutput>,
+    /// Set when a prepared write's logical authority changed before effects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_set_conflict: Option<ReadSetConflictOutput>,
+    /// Set when an overlapping durable recovery intent must be resolved before
+    /// retry. Its table effects may or may not have started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_required: Option<RecoveryRequiredOutput>,
 }
 
-pub fn snapshot_payload(branch: &str, snapshot: &Snapshot) -> SnapshotOutput {
+pub fn snapshot_payload(
+    branch: &str,
+    snapshot: &Snapshot,
+    internal_schema_version: u32,
+) -> SnapshotOutput {
     let mut entries: Vec<_> = snapshot.entries().cloned().collect();
     entries.sort_by(|a, b| a.table_key.cmp(&b.table_key));
     let tables = entries
@@ -603,6 +650,7 @@ pub fn snapshot_payload(branch: &str, snapshot: &Snapshot) -> SnapshotOutput {
     SnapshotOutput {
         branch: branch.to_string(),
         manifest_version: snapshot.version(),
+        internal_schema_version,
         tables,
     }
 }

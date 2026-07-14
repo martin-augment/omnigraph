@@ -36,13 +36,37 @@ use crate::storage::StorageAdapter;
 #[derive(Clone, Default)]
 pub struct QueryIoProbes {
     pub manifest_wrapper: Option<Arc<dyn WrappingObjectStore>>,
-    pub commit_graph_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     /// Attached to the per-table data opens a query performs (the cache-miss
     /// path in `SubTableEntry::open`). Lets a cost test assert how many tables
     /// a query actually opened — N on a cold read, 0 on a warm repeat once the
     /// handle cache (Fix 3) serves them.
     pub table_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub probe_count: Arc<AtomicU64>,
+    /// Counts DATA-table open CALLS through the one instrumented chokepoint
+    /// (`open_dataset`), classified by URI so the
+    /// internal/system tables (`__manifest`) are EXCLUDED — the publisher CAS
+    /// opens those every write, and counting them would make the
+    /// `data_open_count <= |touched_tables|` write gate
+    /// (RFC-013 step 3b) unreachable by threading alone. Unlike the opener-read
+    /// term (which mixes with the merge-insert/RI scan on the write path), this is
+    /// an exact open-invocation count. `forbidden_apis` keeps engine code OUTSIDE the
+    /// storage layer (`exec/`, `db/omnigraph/`, `loader/`, `changes/`) from opening
+    /// datasets except through these chokepoints, so the count is complete for the
+    /// keyed-write data path the gate measures. (Since the dataset-opener
+    /// unification, `table_store.rs`'s branch-management ops also route through
+    /// the one chokepoint, so the count covers them too.)
+    pub data_open_count: Arc<AtomicU64>,
+    /// Internal/system-table (`__manifest`) open CALLS — the complement of
+    /// `data_open_count`, kept for symmetry and debugging.
+    pub internal_open_count: Arc<AtomicU64>,
+    /// Counts topology-index builds (the `RuntimeCache::graph_index` cache-miss
+    /// path). A cost test asserts a fresh branch whose edge tables are unchanged
+    /// from main reuses main's cached index (0 builds) rather than rebuilding it.
+    pub graph_build_count: Arc<AtomicU64>,
+    /// Edge tables included in topology builds this query (summed over build
+    /// invocations). A cost test asserts a query referencing one edge builds only
+    /// that edge, not every catalog edge (the cold-build shrink A2 ships).
+    pub graph_edges_built: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -62,12 +86,34 @@ fn current<R>(f: impl FnOnce(&QueryIoProbes) -> R) -> Option<R> {
     QUERY_IO_PROBES.try_with(f).ok()
 }
 
-pub(crate) fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
-    current(|p| p.manifest_wrapper.clone()).flatten()
+tokio::task_local! {
+    static TRAVERSAL_MODE_OVERRIDE: Option<&'static str>;
 }
 
-pub(crate) fn commit_graph_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
-    current(|p| p.commit_graph_wrapper.clone()).flatten()
+/// Force the Expand execution mode (`"indexed"` | `"csr"`) for the scope of `fut`
+/// WITHOUT mutating the process-global `OMNIGRAPH_TRAVERSAL_MODE` env var. This is
+/// the general traversal-mode test seam: scope-bound (so it cannot leak — the
+/// override is gone when `fut` resolves or unwinds) and process-safe (it never
+/// touches shared state, so a forced-mode test never affects a concurrent test in
+/// the same binary, removing the need for `#[serial]` + a dedicated all-serial
+/// binary). Mirrors [`with_query_io_probes`]. The env var stays the production/ops
+/// escape hatch; this scoped override takes precedence over it
+/// (`exec::query::traversal_indexed_override`).
+pub async fn with_traversal_mode<F>(mode: &'static str, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TRAVERSAL_MODE_OVERRIDE.scope(Some(mode), fut).await
+}
+
+/// The scoped traversal-mode override active for this task, if any. `None` in
+/// production (no scope installed), so the env var is consulted instead.
+pub(crate) fn traversal_mode_override() -> Option<&'static str> {
+    TRAVERSAL_MODE_OVERRIDE.try_with(|m| *m).ok().flatten()
+}
+
+pub(crate) fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
+    current(|p| p.manifest_wrapper.clone()).flatten()
 }
 
 pub(crate) fn table_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
@@ -78,6 +124,43 @@ pub(crate) fn table_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
 /// No-op when no probes are installed (production).
 pub(crate) fn record_probe() {
     let _ = current(|p| p.probe_count.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Internal/system table directory names. An open of one of these is a metadata
+/// open (publisher CAS, recovery audit), NOT a data-table open. Kept in sync with
+/// the dir constants in `db/manifest/layout.rs` and `db/recovery_audit.rs`.
+const INTERNAL_TABLE_DIRS: [&str; 2] = ["__manifest", "_graph_commit_recoveries.lance"];
+
+/// True when `uri`'s last path segment names an internal/system table.
+fn open_is_internal(uri: &str) -> bool {
+    let trimmed = uri.trim_end_matches('/');
+    let last = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    INTERNAL_TABLE_DIRS.contains(&last)
+}
+
+/// Record one table-open call against the active per-query probes, classified by
+/// table class (the URI's last segment) so the write gate counts DATA-table opens
+/// only and ignores the publisher metadata opens. No-op in production
+/// (the classification runs only inside the probe closure, which `current` skips
+/// when no probes are installed). Called at the open chokepoint.
+pub(crate) fn record_open(uri: &str) {
+    let _ = current(|p| {
+        if open_is_internal(uri) {
+            p.internal_open_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            p.data_open_count.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+/// Record one topology-index build over `edges` edge tables (the
+/// `RuntimeCache::graph_index` cache-miss path). No-op when no probes are
+/// installed (production).
+pub(crate) fn record_graph_build(edges: usize) {
+    let _ = current(|p| {
+        p.graph_build_count.fetch_add(1, Ordering::Relaxed);
+        p.graph_edges_built.fetch_add(edges as u64, Ordering::Relaxed);
+    });
 }
 
 /// Per-operation staged-write counts, installed for a task via
@@ -92,9 +175,10 @@ pub struct MergeWriteProbes {
     pub stage_append_rows: Arc<AtomicU64>,
     pub stage_merge_insert_calls: Arc<AtomicU64>,
     pub stage_merge_insert_rows: Arc<AtomicU64>,
-    /// Inline vector-index (IVF) builds. The fast-forward adopt path defers
-    /// index coverage to the reconciler, so an adopt merge must do 0 of these.
-    pub create_vector_index_calls: Arc<AtomicU64>,
+    /// Full-table vector-index (IVF) artifact builds. These count successful
+    /// staging, not HEAD publication; a stale prepared attempt may abandon the
+    /// immutable artifact before commit.
+    pub stage_vector_index_calls: Arc<AtomicU64>,
     /// Times the merge materialized a staged delta into one in-memory batch
     /// (`scan_staged_combined`). The append path streams instead, so an
     /// append-only fast-forward merge must do 0 of these.
@@ -114,8 +198,8 @@ impl MergeWriteProbes {
     pub fn stage_merge_insert_rows(&self) -> u64 {
         self.stage_merge_insert_rows.load(Ordering::Relaxed)
     }
-    pub fn create_vector_index_calls(&self) -> u64 {
-        self.create_vector_index_calls.load(Ordering::Relaxed)
+    pub fn stage_vector_index_calls(&self) -> u64 {
+        self.stage_vector_index_calls.load(Ordering::Relaxed)
     }
     pub fn scan_staged_combined_calls(&self) -> u64 {
         self.scan_staged_combined_calls.load(Ordering::Relaxed)
@@ -153,11 +237,11 @@ pub(crate) fn record_stage_merge_insert(rows: u64) {
     });
 }
 
-/// Record one inline vector-index build against the active probes. No-op in
-/// production (no probes installed).
-pub(crate) fn record_create_vector_index() {
+/// Record one successfully staged vector-index artifact build against the
+/// active probes. No-op in production (no probes installed).
+pub(crate) fn record_stage_vector_index() {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
-        p.create_vector_index_calls.fetch_add(1, Ordering::Relaxed);
+        p.stage_vector_index_calls.fetch_add(1, Ordering::Relaxed);
     });
 }
 
@@ -169,45 +253,49 @@ pub(crate) fn record_scan_staged_combined() {
     });
 }
 
-/// Open a Lance dataset at `uri`, attaching `wrapper` (for IO counting) when
-/// present. With no wrapper this is exactly `Dataset::open(uri)`. The wrapper is
-/// set via `ObjectStoreParams` on the builder so the open itself is counted
-/// (`Dataset::with_object_store_wrappers` only wraps an already-open store).
-pub(crate) async fn open_dataset_tracked(
-    uri: &str,
-    wrapper: Option<Arc<dyn WrappingObjectStore>>,
-) -> Result<Dataset> {
-    let result = match wrapper {
-        None => Dataset::open(uri).await,
-        Some(wrapper) => {
-            DatasetBuilder::from_uri(uri)
-                .with_store_params(ObjectStoreParams {
-                    object_store_wrapper: Some(wrapper),
-                    ..Default::default()
-                })
-                .load()
-                .await
-        }
-    };
-    result.map_err(|e| OmniError::Lance(e.to_string()))
+/// Which version [`open_dataset`] resolves.
+///
+/// `Latest` re-resolves the dataset's current head (the substrate's cheap
+/// latest-location probe); `At(v)` is a list-free pinned open. The choice is
+/// a correctness decision — strict read-modify-write ops need `Latest`,
+/// snapshot reads need `At(v)` — so it is an explicit parameter of the one
+/// opener rather than a property of which helper a caller happened to reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VersionResolution {
+    Latest,
+    At(u64),
 }
 
-/// Open a data-table dataset at `location` pinned to `version` — the cache-miss
-/// path of the data-read boundary (`SubTableEntry::open`). Attaches the shared
-/// per-graph `Session` (warms metadata/index caches across opens, LanceDB's
-/// one-session-per-connection pattern) and the per-query `table_wrapper` (for IO
-/// counting) when present. With neither, this is exactly the Fix-2
-/// `from_uri(location).with_version(version)` open.
-pub(crate) async fn open_table_dataset(
-    location: &str,
-    version: u64,
+/// THE dataset-open chokepoint. Every engine `Dataset` open routes through
+/// here so three things hold uniformly, on every path:
+///
+/// 1. `record_open` feeds the per-query cost probes — an open that bypasses
+///    this function is invisible to the cost gates.
+/// 2. The per-query IO `wrapper` (manifest- or table-class) is set via
+///    `ObjectStoreParams` on the builder, so the open itself is counted
+///    (`Dataset::with_object_store_wrappers` only wraps an already-open
+///    store). No wrapper (production) adds nothing.
+/// 3. The shared per-graph `Session` (LanceDB's one-session-per-connection
+///    pattern; warms Lance's metadata/index caches across opens) is attached
+///    whenever the caller has one. `None` is for genuinely session-less
+///    contexts (a `Snapshot` detached from its graph's read caches) — owners
+///    that hold a session (`TableStore`, the handle cache) pass it
+///    unconditionally, so it cannot be silently dropped on one path.
+pub(crate) async fn open_dataset(
+    uri: &str,
+    version: VersionResolution,
     session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
-    let mut builder = DatasetBuilder::from_uri(location).with_version(version);
+    record_open(uri);
+    let mut builder = DatasetBuilder::from_uri(uri);
+    if let VersionResolution::At(version) = version {
+        builder = builder.with_version(version);
+    }
     if let Some(session) = session {
         builder = builder.with_session(session.clone());
     }
-    if let Some(wrapper) = table_wrapper() {
+    if let Some(wrapper) = wrapper {
         builder = builder.with_store_params(ObjectStoreParams {
             object_store_wrapper: Some(wrapper),
             ..Default::default()
@@ -226,6 +314,8 @@ pub struct StorageReadCounts {
     pub exists: AtomicU64,
     pub read_text_versioned: AtomicU64,
     pub list_dir: AtomicU64,
+    pub write_text: AtomicU64,
+    pub delete: AtomicU64,
 }
 
 impl StorageReadCounts {
@@ -240,6 +330,12 @@ impl StorageReadCounts {
     }
     pub fn list_dir(&self) -> u64 {
         self.list_dir.load(Ordering::Relaxed)
+    }
+    pub fn write_text(&self) -> u64 {
+        self.write_text.load(Ordering::Relaxed)
+    }
+    pub fn delete(&self) -> u64 {
+        self.delete.load(Ordering::Relaxed)
     }
 }
 
@@ -273,6 +369,7 @@ impl StorageAdapter for CountingStorageAdapter {
     }
 
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
+        self.counts.write_text.fetch_add(1, Ordering::Relaxed);
         self.inner.write_text(uri, contents).await
     }
 
@@ -290,6 +387,7 @@ impl StorageAdapter for CountingStorageAdapter {
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
+        self.counts.delete.fetch_add(1, Ordering::Relaxed);
         self.inner.delete(uri).await
     }
 

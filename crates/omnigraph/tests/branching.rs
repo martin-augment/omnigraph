@@ -4,7 +4,6 @@ use std::fs;
 
 use arrow_array::{Array, Int32Array, UInt64Array};
 use futures::TryStreamExt;
-use lance::index::DatasetIndexExt;
 use lance_index::is_system_index;
 
 use omnigraph::db::commit_graph::CommitGraph;
@@ -128,6 +127,19 @@ async fn branch_create_open_list_and_lazy_branching_work() {
     let uri = dir.path().to_str().unwrap();
     let mut main = init_and_load(&dir).await;
 
+    main.branch_create("feature").await.unwrap();
+    // Reproduce Lance's phase-1-only crash state: keep the shallow-cloned
+    // `tree/feature` dataset but remove BranchContents, its sole logical
+    // authority. A same-name graph create must reclaim the zombie and retry,
+    // rather than surfacing DatasetAlreadyExists forever.
+    std::fs::remove_file(
+        dir.path()
+            .join("__manifest")
+            .join("_refs")
+            .join("branches")
+            .join("feature.json"),
+    )
+    .unwrap();
     main.branch_create("feature").await.unwrap();
     assert_eq!(main.branch_list().await.unwrap(), vec!["main", "feature"]);
 
@@ -351,6 +363,22 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     )
     .await
     .unwrap();
+
+    // This regression must not rely on an incidental physical index selecting
+    // Lance's legacy partial-column merge plan. The materialized-blob update
+    // path is correct even when the table has no user index at all.
+    let ds = snapshot_main(&main)
+        .await
+        .unwrap()
+        .open("node:Document")
+        .await
+        .unwrap();
+    let indices = ds.load_indices().await.unwrap();
+    assert!(
+        indices.iter().all(is_system_index),
+        "blob correctness regression requires an index-absent table"
+    );
+
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -629,7 +657,10 @@ async fn same_branch_insert_after_external_commit_is_linear() {
         .iter()
         .filter(|c| c.parent_commit_id.as_deref() == Some(c0.graph_commit_id.as_str()))
         .count();
-    assert_eq!(c0_children, 1, "C0 must have exactly one child; two is the fork");
+    assert_eq!(
+        c0_children, 1,
+        "C0 must have exactly one child; two is the fork"
+    );
 }
 
 /// Strict update after a read: Fix 1's `refresh_manifest_only` makes the read
@@ -676,7 +707,10 @@ async fn same_branch_update_after_external_commit_and_read_is_linear() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(cb.parent_commit_id.as_deref(), Some(ca.graph_commit_id.as_str()));
+    assert_eq!(
+        cb.parent_commit_id.as_deref(),
+        Some(ca.graph_commit_id.as_str())
+    );
 
     // A reads main: the stale-probe path refreshes A's MANIFEST (via
     // refresh_manifest_only) but not its commit-graph head, freshening the
@@ -713,7 +747,10 @@ async fn same_branch_update_after_external_commit_and_read_is_linear() {
         .iter()
         .filter(|c| c.parent_commit_id.as_deref() == Some(ca.graph_commit_id.as_str()))
         .count();
-    assert_eq!(ca_children, 1, "Ca must have exactly one child; two is the fork");
+    assert_eq!(
+        ca_children, 1,
+        "Ca must have exactly one child; two is the fork"
+    );
 }
 
 #[tokio::test]
@@ -1019,6 +1056,18 @@ async fn branch_created_from_non_main_inherits_branch_state() {
         .branch_create_from(ReadTarget::branch("feature"), "experiment")
         .await
         .unwrap();
+    std::fs::remove_file(
+        dir.path()
+            .join("__manifest")
+            .join("_refs")
+            .join("branches")
+            .join("experiment.json"),
+    )
+    .unwrap();
+    feature
+        .branch_create_from(ReadTarget::branch("feature"), "experiment")
+        .await
+        .expect("non-main create must also reclaim a clone-only target");
 
     assert_eq!(
         feature.branch_list().await.unwrap(),
@@ -1050,7 +1099,7 @@ async fn branch_created_from_non_main_inherits_branch_state() {
 }
 
 #[tokio::test]
-async fn ensure_indices_on_child_branch_forks_inherited_table_ownership() {
+async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_needed() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut main = init_and_load(&dir).await;
@@ -1091,7 +1140,8 @@ async fn ensure_indices_on_child_branch_forks_inherited_table_ownership() {
             .unwrap()
             .table_branch
             .as_deref(),
-        Some("experiment")
+        Some("feature"),
+        "index reconciliation must not manufacture a ref-only first-touch effect"
     );
     assert_eq!(
         experiment_snap
@@ -1428,25 +1478,70 @@ async fn branch_merge_reports_cardinality_violation_conflict() {
     }
 }
 
+/// Fix C regression: a table adopted by pointer switch (`AdoptSourceState`)
+/// must still be validated. Merging `main` -> `feature` where `feature` deleted
+/// a node and `main` added an edge referencing it classifies the edge table as
+/// `AdoptSourceState` (source on main, target on a branch). The unified
+/// evaluator must see the adopted edge and reject the orphan; before the fix it
+/// skipped the table entirely and silently published the dangling edge.
 #[tokio::test]
-async fn branch_create_bootstraps_missing_commit_graph() {
+async fn merge_main_into_branch_validates_adopted_edge_against_branch_node_delete() {
+    const MUTATIONS: &str = r#"
+query add_knows($from: String, $to: String) {
+    insert Knows { from: $from, to: $to }
+}
+
+query delete_person($name: String) {
+    delete Person where name = $name
+}
+"#;
+
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = init_and_load(&dir).await;
-    drop(db);
+    let mut main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
 
-    fs::remove_dir_all(dir.path().join("_graph_commits.lance")).unwrap();
+    // main (merge source): add an edge referencing Bob.
+    mutate_main(
+        &mut main,
+        MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
 
-    let mut reopened = Omnigraph::open(uri).await.unwrap();
-    reopened.branch_create("feature").await.unwrap();
+    // feature (merge target): delete Bob.
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATIONS,
+        "delete_person",
+        &params(&[("$name", "Bob")]),
+    )
+    .await
+    .unwrap();
 
-    assert!(dir.path().join("_graph_commits.lance").exists());
-
-    let feature = Omnigraph::open(uri).await.unwrap();
-    assert_eq!(
-        count_rows_branch(&feature, "feature", "node:Person").await,
-        4
-    );
+    // Merge main -> feature: edge:Knows is adopted by pointer switch
+    // (AdoptSourceState). The adopted edge Alice->Bob references Bob, which the
+    // target branch deleted, so the merge must reject with OrphanEdge.
+    let err = feature
+        .branch_merge("main", "feature")
+        .await
+        .expect_err("adopting main's edge into a branch that deleted its endpoint must conflict");
+    match err {
+        OmniError::MergeConflicts(conflicts) => {
+            assert!(
+                conflicts
+                    .iter()
+                    .any(|c| c.table_key == "edge:Knows"
+                        && c.kind == MergeConflictKind::OrphanEdge),
+                "expected OrphanEdge on edge:Knows, got {conflicts:?}"
+            );
+        }
+        other => panic!("expected merge conflicts, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1459,6 +1554,17 @@ async fn branch_api_rejects_reserved_main_and_same_source_target_merge() {
 
     let err = db.branch_delete("main").await.unwrap_err();
     assert!(err.to_string().contains("cannot delete branch 'main'"));
+
+    let err = db.branch_create("bad branch").await.unwrap_err();
+    assert!(err.to_string().contains("invalid") || err.to_string().contains("allowed"));
+    assert!(
+        !dir.path()
+            .join("__manifest")
+            .join("tree")
+            .join("bad branch")
+            .exists(),
+        "branch names must be validated before Lance's shallow-clone phase"
+    );
 
     let err = db.branch_merge("main", "main").await.unwrap_err();
     assert!(err.to_string().contains("distinct source and target"));
@@ -1502,6 +1608,91 @@ async fn branch_delete_removes_owned_table_branches_and_allows_recreate() {
     .unwrap();
 
     assert_eq!(count_rows_branch(&main, "feature", "node:Person").await, 5);
+}
+
+#[tokio::test]
+async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    db.branch_create("feature").await.unwrap();
+    let err = db.branch_create("feature/child").await.unwrap_err();
+    assert!(
+        err.to_string().contains("physical Lance path")
+            && err.to_string().contains("ancestors or descendants"),
+        "prefix collision must be actionable; got: {err}"
+    );
+    assert!(
+        !dir.path()
+            .join("__manifest")
+            .join("tree")
+            .join("feature")
+            .join("child")
+            .exists(),
+        "prefix admission must reject before Lance creates the target clone"
+    );
+
+    db.branch_delete("feature").await.unwrap();
+    db.branch_create("feature/child").await.unwrap();
+    let err = db.branch_create("feature").await.unwrap_err();
+    assert!(
+        err.to_string().contains("physical Lance path")
+            && err.to_string().contains("feature/child"),
+        "ancestor creation must reject the inverse prefix collision; got: {err}"
+    );
+    assert!(
+        !lance::Dataset::open(&format!("{}/__manifest", dir.path().display()))
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "inverse admission refusal must not create an ancestor ref"
+    );
+}
+
+#[tokio::test]
+async fn branch_delete_refuses_legacy_physical_path_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = init_and_load(&dir).await;
+    db.branch_create("feature/child").await.unwrap();
+
+    // Forge a graph written before the prefix-disjoint namespace invariant.
+    // Lance permits both refs but intentionally cannot reclaim the ancestor's
+    // dataset directory while the child path is live.
+    let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
+        .await
+        .unwrap();
+    let version = manifest.version().version;
+    manifest
+        .create_branch("feature", version, None)
+        .await
+        .unwrap();
+
+    let err = db.branch_delete("feature").await.unwrap_err();
+    assert!(
+        err.to_string().contains("feature/child")
+            && err.to_string().contains("delete the child branch first"),
+        "legacy prefix collisions must be deleted leaf-first; got: {err}"
+    );
+    assert!(
+        manifest
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "refusal must not remove ancestor authority"
+    );
+
+    db.branch_delete("feature/child").await.unwrap();
+    db.branch_delete("feature").await.unwrap();
+    assert_eq!(
+        db.branch_list().await.unwrap(),
+        vec!["main"],
+        "legacy overlap must converge when deleted leaf-first"
+    );
 }
 
 #[tokio::test]

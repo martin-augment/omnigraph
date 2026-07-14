@@ -21,6 +21,12 @@ properties in the assignment block (`insert WorksAt { person: $p, org: $o }`).
 
 `<value>` is a literal, `$param`, or `now()`.
 
+On a blob-bearing type, an update materializes and rewrites blob payloads only
+for the rows matched by its predicate, including blobs the update does not
+change. This keeps correctness independent of physical index state, but adds
+read/write I/O proportional to the matched blob bytes; use selective update
+predicates for large blobs.
+
 ## Atomicity
 
 A change query publishes **one commit** at the end of the query. Multiple
@@ -28,6 +34,19 @@ insert/update statements accumulate in memory and commit together — a mid-quer
 failure leaves the graph untouched. See [transactions](../branching/transactions.md)
 for the per-query atomicity contract and [branches](../branching/index.md) for
 multi-query workflows.
+
+Concurrent changes use optimistic concurrency over the whole target branch.
+Insert/Merge/Append operations whose branch changed before physical effects are
+discarded and fully revalidated with a bounded internal retry. Strict
+Update/Delete/Overwrite operations instead return a structured conflict. This
+branch-wide token is deliberately conservative: a change to a different table
+can invalidate a prepared strict write because constraints may have read it.
+
+If the synchronous barrier finds an unresolved overlapping recovery intent, or
+if a conflict is discovered after a Lance table effect is durable, the request
+returns `recovery_required` with an operation id. Do not immediately retry that
+request; reopen the graph read-write (or restart the server) so the durable
+recovery intent is resolved first.
 
 ## Inserts/updates and deletes cannot mix in one query
 
@@ -38,11 +57,12 @@ Mixing the two is rejected at parse time, before any I/O:
 > into separate mutations: (1) inserts and updates, then (2) deletes.`
 
 Run two separate queries instead — the inserts/updates first, then the deletes.
-The restriction exists because inserts/updates and deletes commit through
-different paths today, and mixing them in one query creates ordering hazards
-(e.g. a same-row insert-then-delete, or a cascading delete of a just-inserted
-edge). Keeping the two kinds in separate queries keeps each one atomic and
-correct.
+Each query is still atomic on its own. This is a deliberate rule: inserts,
+updates, and deletes all stage and commit through the same path, but keeping a
+single query to one kind means its read-your-writes stays unambiguous (a read
+within the query never has to reconcile rows you inserted against rows you
+deleted in the same query). If you need the inserts/updates and deletes to land
+as **one** atomic commit, run them on a branch and merge it.
 
 ## Bulk loading
 

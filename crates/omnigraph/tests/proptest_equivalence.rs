@@ -9,10 +9,10 @@
 //! third ExpandMode, the anti-join fast/slow fork) fail loudly instead of
 //! silently.
 //!
-//! Each test is a sync `#[test]` + `#[serial]`: it builds its own runtime and
-//! `block_on`s per generated case (proptest closures are sync), and the
-//! mode-equivalence test writes `OMNIGRAPH_TRAVERSAL_MODE`, so serial execution
-//! keeps env writes from racing other tests in this binary.
+//! Each test is a sync `#[test]`: it builds its own runtime and `block_on`s per
+//! generated case (proptest closures are sync). The mode-equivalence test forces
+//! the Expand mode via the scoped `with_traversal_mode` seam — no env mutation, so
+//! no `#[serial]` and no leak across shrink/cases.
 
 mod helpers;
 
@@ -21,9 +21,9 @@ use std::collections::HashSet;
 use arrow_array::{Array, StringArray};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
-use serial_test::serial;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::instrumentation::with_traversal_mode;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
@@ -39,6 +39,13 @@ query friends($name: String) {
     match {
         $p: Person { name: $name }
         $p knows{1,3} $f
+    }
+    return { $f.name }
+}
+query related($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows>{1,3} $f
     }
     return { $f.name }
 }
@@ -138,27 +145,6 @@ fn config() -> Config {
     }
 }
 
-fn clear_mode() {
-    unsafe { std::env::remove_var("OMNIGRAPH_TRAVERSAL_MODE") };
-}
-
-/// RAII guard that sets `OMNIGRAPH_TRAVERSAL_MODE` and clears it on drop — so a
-/// panic mid-case (e.g. a query `unwrap`) cannot leak the forced mode into
-/// proptest's subsequent shrink/cases and mask the divergence under test. SAFE:
-/// every test in this binary is `#[serial]`, so no thread reads the env during
-/// the write.
-struct ModeGuard;
-impl ModeGuard {
-    fn set(mode: &str) -> Self {
-        unsafe { std::env::set_var("OMNIGRAPH_TRAVERSAL_MODE", mode) };
-        ModeGuard
-    }
-}
-impl Drop for ModeGuard {
-    fn drop(&mut self) {
-        unsafe { std::env::remove_var("OMNIGRAPH_TRAVERSAL_MODE") };
-    }
-}
 
 async fn load_graph(graph: &GenGraph) -> (tempfile::TempDir, Omnigraph) {
     let dir = tempfile::tempdir().unwrap();
@@ -199,11 +185,11 @@ async fn col0_set(db: &mut Omnigraph, name: &str, params: &ParamMap) -> HashSet<
 
 // INVARIANT 1: mode equivalence. For any generated graph and start key, the
 // CSR, indexed, and auto paths return identical result multisets — over both a
-// same-type traversal (knows{1,3}, exercises cycles/self-loops) and a cross-type
-// one (worksAt{1,2}, collision-prone). This is the search-over-the-class version
+// same-type traversal (knows{1,3}, exercises cycles/self-loops), its undirected
+// form (<knows>{1,3} — Direction::Both must agree across arms, incl. dedup of
+// pairs present both ways), and a cross-type one (worksAt{1,2}, collision-prone). This is the search-over-the-class version
 // of the hand-built cross-type-collision fixture.
 #[test]
-#[serial]
 fn prop_expand_indexed_eq_csr() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut runner = TestRunner::new(config());
@@ -213,18 +199,13 @@ fn prop_expand_indexed_eq_csr() {
                 let (_dir, mut db) = load_graph(&graph).await;
                 for start in graph.persons.clone() {
                     let p = one_param(&start);
-                    for q in ["friends", "employers"] {
-                        // Each guard clears the mode on drop (end of the block,
-                        // or on panic), so a forced mode never leaks across runs.
-                        let csr = {
-                            let _g = ModeGuard::set("csr");
-                            col0_sorted(&mut db, q, &p).await
-                        };
-                        let indexed = {
-                            let _g = ModeGuard::set("indexed");
-                            col0_sorted(&mut db, q, &p).await
-                        };
-                        // No guard → env unset → auto (cost-based) path.
+                    for q in ["friends", "related", "employers"] {
+                        // The seam is scope-bound: the forced mode is gone when the
+                        // wrapped future resolves, so it never leaks across runs.
+                        let csr = with_traversal_mode("csr", col0_sorted(&mut db, q, &p)).await;
+                        let indexed =
+                            with_traversal_mode("indexed", col0_sorted(&mut db, q, &p)).await;
+                        // No override → auto (cost-based) path.
                         let auto = col0_sorted(&mut db, q, &p).await;
                         if csr != indexed || csr != auto {
                             return Some((start, q, csr, indexed, auto));
@@ -247,9 +228,7 @@ fn prop_expand_indexed_eq_csr() {
 // destination type's loaded key set — independent of the two-mode comparison, so
 // it catches over-emission even if both modes are wrong identically.
 #[test]
-#[serial]
 fn prop_results_subset_of_existing_nodes() {
-    clear_mode();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut runner = TestRunner::new(config());
     runner
@@ -282,9 +261,7 @@ fn prop_results_subset_of_existing_nodes() {
 // INVARIANT 3: anti-join complement. `not { $p worksAt $_ }` and its complement
 // (persons WITH a worksAt) must be disjoint and together cover all persons.
 #[test]
-#[serial]
 fn prop_antijoin_partitions_persons() {
-    clear_mode();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut runner = TestRunner::new(config());
     runner

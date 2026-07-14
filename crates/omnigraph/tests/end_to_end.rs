@@ -233,8 +233,15 @@ async fn overwrite_replaces_data() {
         .await
         .unwrap();
 
-    // Overwrite with just one person
-    let small = r#"{"type": "Person", "data": {"name": "Zara", "age": 40}}"#;
+    // Overwrite to a small SELF-CONSISTENT image. Overwrite is per-table, so a
+    // Person-only overwrite would drop Alice/Bob while the retained Knows/WorksAt
+    // edges still reference them — a now-rejected orphan (see
+    // `validators::overwrite_node_removal_rejects_retained_orphan_edge`). To
+    // replace the graph, overwrite the edge tables too; Company stays retained
+    // and Zara->Acme references it.
+    let small = r#"{"type": "Person", "data": {"name": "Zara", "age": 40}}
+{"edge": "Knows", "from": "Zara", "to": "Zara"}
+{"edge": "WorksAt", "from": "Zara", "to": "Acme"}"#;
     load_jsonl(&mut db, small, LoadMode::Overwrite)
         .await
         .unwrap();
@@ -1144,6 +1151,7 @@ async fn blob_read_after_mutation_insert() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let stale_reader = Omnigraph::open(uri).await.unwrap();
 
     // Insert via mutation (base64 for bytes [1, 2, 3])
     mutate_main(
@@ -1155,7 +1163,10 @@ async fn blob_read_after_mutation_insert() {
     .await
     .unwrap();
 
-    let blob = db
+    // The reader was opened before the other handle's commit. `read_blob`
+    // must freshness-probe its current branch instead of using its held
+    // coordinator snapshot.
+    let blob = stale_reader
         .read_blob("Document", "inserted", "content")
         .await
         .unwrap();

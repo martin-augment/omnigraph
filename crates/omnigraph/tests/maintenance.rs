@@ -9,16 +9,16 @@ use std::time::Duration;
 
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
+use omnigraph::IndexCoverage;
 use omnigraph::db::{
     CleanupPolicyOptions, Omnigraph, ReadTarget, RepairAction, RepairClassification, RepairOptions,
     SkipReason,
 };
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph::table_store::{IndexCoverage, TableStore};
 
 use helpers::{
-    MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, init_and_load, mixed_params, mutate_main,
-    snapshot_main,
+    MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, count_rows_branch, init_and_load,
+    mixed_params, mutate_main, snapshot_main,
 };
 
 /// Filesystem URI of a node sub-table, mirroring the engine's layout
@@ -94,13 +94,27 @@ async fn optimize_on_empty_graph_returns_stats_per_table_with_no_changes() {
 
     let stats = db.optimize().await.unwrap();
 
-    // Schema declares 2 nodes + 2 edges = 4 tables. Compaction should run on
-    // each but find nothing to merge.
-    assert_eq!(stats.len(), 4);
+    // Schema declares 2 nodes + 2 edges = 4 data tables, plus the one internal
+    // system table optimize compacts (`__manifest`, RFC-013 step 2) = 5. Graph
+    // lineage lives in `__manifest` (Phase B retired the commit-graph datasets),
+    // so there is no separate lineage table to compact. Compaction runs on each
+    // but finds nothing to merge: the genesis graph commit rides the SINGLE init
+    // `__manifest` write (RFC-013 Phase 7), so a fresh graph has one fragment per
+    // table — nothing to compact anywhere.
+    assert_eq!(stats.len(), 5);
     for s in &stats {
         assert_eq!(s.fragments_removed, 0, "{} should not remove", s.table_key);
         assert_eq!(s.fragments_added, 0, "{} should not add", s.table_key);
     }
+    // `__manifest` is present and reported as a no-op on an empty graph.
+    let s = stats
+        .iter()
+        .find(|s| s.table_key == "__manifest")
+        .expect("optimize stats missing internal table __manifest");
+    assert!(
+        !s.committed,
+        "__manifest should be a no-op on an empty graph"
+    );
 }
 
 #[tokio::test]
@@ -110,6 +124,13 @@ async fn optimize_after_load_then_again_is_idempotent() {
 
     // First pass may compact (load wrote real fragments).
     let _first = db.optimize().await.unwrap();
+
+    let commits_before = db.list_commits(None).await.unwrap();
+    let head_before = commits_before
+        .last()
+        .expect("loaded graph has a lineage head")
+        .graph_commit_id
+        .clone();
 
     // Second pass should be a no-op: already-compacted graph produces no
     // fragments_removed / fragments_added.
@@ -131,6 +152,231 @@ async fn optimize_after_load_then_again_is_idempotent() {
             s.table_key
         );
     }
+    let commits_after = db.list_commits(None).await.unwrap();
+    assert_eq!(
+        commits_after.len(),
+        commits_before.len(),
+        "steady-state Optimize must not manufacture graph lineage"
+    );
+    assert_eq!(
+        commits_after.last().unwrap().graph_commit_id,
+        head_before,
+        "steady-state Optimize must preserve the graph head"
+    );
+    assert!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
+        "steady-state Optimize must not arm a recovery sidecar"
+    );
+}
+
+/// RFC-013 step 2 + Phase 7 + Phase B: `optimize` compacts `__manifest`, which
+/// now accumulates one fragment per commit for BOTH the table-version rows and the
+/// folded-in graph-lineage rows (`graph_commit` + `graph_head`). Graph lineage
+/// lives entirely in `__manifest` (Phase B retired the commit-graph datasets), so
+/// `__manifest` is the only internal table optimize compacts. After compaction
+/// `__manifest` sheds fragments and writes no recovery sidecar (it is read at
+/// HEAD and every config/reserve/rewrite step is content-preserving), and the graph stays coherent for
+/// subsequent reads + strict writes.
+#[tokio::test]
+async fn optimize_compacts_internal_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Build version-history depth so `__manifest` accumulates fragments.
+    for i in 0..20 {
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", &format!("p{i}"))], &[("$age", 30)]),
+        )
+        .await
+        .unwrap();
+    }
+
+    let stats = db.optimize().await.unwrap();
+
+    // `__manifest` carries every per-commit fragment (table versions + lineage)
+    // and compacts.
+    let manifest_stats = stats
+        .iter()
+        .find(|s| s.table_key == "__manifest")
+        .expect("optimize stats missing internal table __manifest");
+    assert!(
+        manifest_stats.committed,
+        "__manifest should compact after 20 commits"
+    );
+    assert!(
+        manifest_stats.fragments_removed > 0,
+        "__manifest should shed fragments, removed {}",
+        manifest_stats.fragments_removed
+    );
+
+    // `__manifest` is the only internal table optimize touches (Phase B retired
+    // the commit-graph datasets), so no `_graph_commits*` stat is emitted.
+    assert!(
+        !stats
+            .iter()
+            .any(|s| s.table_key == "_graph_commits" || s.table_key == "_graph_commit_actors"),
+        "no commit-graph datasets exist after Phase B — optimize must not report them"
+    );
+
+    // Internal compaction leaks no recovery sidecar.
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        let leftover: Vec<_> = std::fs::read_dir(&recovery_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "optimize leaked recovery sidecars: {leftover:?}"
+        );
+    }
+
+    // Coherent after internal compaction: reads + a strict write still work.
+    assert!(count_rows(&db, "node:Person").await > 0);
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "after_compact")], &[("$age", 40)]),
+    )
+    .await
+    .unwrap();
+}
+
+/// `optimize` must stay NON-DESTRUCTIVE on a pre-`auto_cleanup`-fix upgraded graph:
+/// `compact_files` would otherwise fire the dataset's stored `lance.auto_cleanup.*`
+/// hook (version GC) during the compaction commit. Internal-table compaction clears
+/// that stale config first, so no versions are deleted. Without the clear, the
+/// aggressive policy below GCs old versions and the count drops.
+#[tokio::test]
+async fn optimize_clears_stale_auto_cleanup_and_preserves_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    for i in 0..5 {
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", &format!("v{i}"))], &[("$age", 30)]),
+        )
+        .await
+        .unwrap();
+    }
+    let manifest_uri = format!("{}/__manifest", dir.path().to_str().unwrap());
+
+    // Simulate an upgraded graph: an aggressive stored auto_cleanup config that, if
+    // it fired during compaction, would GC old versions.
+    {
+        let mut ds = Dataset::open(&manifest_uri).await.unwrap();
+        ds.update_config([
+            ("lance.auto_cleanup.interval", Some("1")),
+            ("lance.auto_cleanup.older_than", Some("0s")),
+        ])
+        .await
+        .unwrap();
+    }
+    let versions_before = Dataset::open(&manifest_uri)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+
+    db.optimize().await.unwrap();
+
+    let ds = Dataset::open(&manifest_uri).await.unwrap();
+    // (a) the stale auto_cleanup config was cleared (non-destructive by construction).
+    assert!(
+        !ds.config()
+            .keys()
+            .any(|k| k.starts_with("lance.auto_cleanup.")),
+        "optimize must clear stale auto_cleanup config; config = {:?}",
+        ds.config()
+    );
+    // (b) no version GC: every pre-optimize version survives (compaction + the
+    // config-clear each add versions, so the count only grows).
+    let versions_after = ds.versions().await.unwrap().len();
+    assert!(
+        versions_after >= versions_before,
+        "optimize must not GC __manifest versions: before={versions_before} after={versions_after}"
+    );
+}
+
+/// The same non-destructive guarantee on a DATA (node/edge) table, not just the
+/// internal tables. `apply_optimize_table_effects` runs `compact_files` / `optimize_indices`
+/// with a default `CommitConfig` (`skip_auto_cleanup = false`); on an upgraded
+/// graph whose Person table still carries the pre-v7 `lance.auto_cleanup.*` config,
+/// those commits would fire Lance's version-GC hook and prune `__manifest`-pinned
+/// data-table versions. The path must strip that config first. Without the strip,
+/// the aggressive policy below GCs old versions and the config survives the run.
+#[tokio::test]
+async fn optimize_clears_stale_auto_cleanup_on_data_tables_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let mut db = init_and_load(&dir).await;
+    add_person_fragments(&mut db).await; // multiple fragments → will_compact
+
+    // Simulate an upgraded graph: set an aggressive stored auto_cleanup config on
+    // the Person table. This is an out-of-band Lance commit (an `UpdateConfig` that
+    // advances HEAD past the manifest), so realign the manifest with a forced repair
+    // first — otherwise optimize skips the table as uncovered drift and never
+    // reaches the scrub. (Forced because UpdateConfig is not verified maintenance.)
+    let (_, _, person_full) = person_manifest_and_head(&db, &root).await;
+    {
+        let mut ds = Dataset::open(&person_full).await.unwrap();
+        ds.update_config([
+            ("lance.auto_cleanup.interval", Some("1")),
+            ("lance.auto_cleanup.older_than", Some("0s")),
+        ])
+        .await
+        .unwrap();
+    }
+    db.repair(RepairOptions {
+        confirm: true,
+        force: true,
+    })
+    .await
+    .unwrap();
+
+    let versions_before = Dataset::open(&person_full)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+    let rows_before = count_rows(&db, "node:Person").await;
+
+    db.optimize().await.unwrap();
+
+    let ds = Dataset::open(&person_full).await.unwrap();
+    // (a) the stale auto_cleanup config was cleared (non-destructive by construction).
+    assert!(
+        !ds.config()
+            .keys()
+            .any(|k| k.starts_with("lance.auto_cleanup.")),
+        "optimize must clear stale auto_cleanup config on data tables; config = {:?}",
+        ds.config()
+    );
+    // (b) no version GC: every pre-optimize version survives (compaction + the
+    // config-clear each add versions, so the count only grows).
+    let versions_after = ds.versions().await.unwrap().len();
+    assert!(
+        versions_after >= versions_before,
+        "optimize must not GC Person versions: before={versions_before} after={versions_after}"
+    );
+    // (c) data is intact — the run rewrote fragments, it did not drop rows.
+    assert_eq!(count_rows(&db, "node:Person").await, rows_before);
 }
 
 // PR3 (Workstream B): an existing scalar index does not cover fragments
@@ -149,7 +395,8 @@ node Doc {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
 
-    // First load builds the id + rank BTREEs over the initial fragment.
+    // Loads publish only data effects; establish the initial id + rank BTREEs
+    // explicitly through the reconciler before creating partial coverage.
     load_jsonl(
         &mut db,
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
@@ -158,6 +405,7 @@ node Doc {
     )
     .await
     .unwrap();
+    db.ensure_indices().await.unwrap();
 
     // A second load with NEW keys appends a fragment the existing BTREEs do not
     // cover (the existence gate skips re-building an index that already exists).
@@ -175,7 +423,7 @@ node Doc {
         let snap = snapshot_main(&db).await.unwrap();
         let ds = snap.open("node:Doc").await.unwrap();
         assert!(
-            TableStore::has_unindexed_fragments(&ds).await.unwrap(),
+            ds.has_unindexed_fragments().await.unwrap(),
             "appended fragment should be unindexed before optimize"
         );
     }
@@ -187,46 +435,43 @@ node Doc {
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Doc").await.unwrap();
     assert!(
-        !TableStore::has_unindexed_fragments(&ds).await.unwrap(),
+        !ds.has_unindexed_fragments().await.unwrap(),
         "optimize must extend index coverage to all fragments"
     );
     assert_eq!(
-        TableStore::key_column_index_coverage(&ds, "rank")
-            .await
-            .unwrap(),
+        ds.index_coverage("rank").await.unwrap(),
         IndexCoverage::Indexed,
         "rank BTREE must cover all fragments after optimize"
     );
 }
 
-// Regression: `optimize` must not crash on a graph that has a `Blob` table.
+// Regression: `optimize` must compact a graph that has a `Blob` table through
+// the same positive path as every other data table; a reintroduced skip would
+// hide both fragment growth and a Lance compatibility regression.
 //
-// Lance `compact_files` forces `BlobHandling::AllBinary`, which mis-decodes
-// blob-v2 columns ("more fields in the schema than provided column indices"),
-// failing even a pristine uniform-V2_2 multi-fragment blob table. `optimize`
-// must skip blob-bearing tables (and report the skip) rather than aborting the
-// whole sweep.
-//
-// Before the skip fix, `optimize()` returned that Lance error here and aborted
-// the whole sweep; it now skips the blob table (`doc.skipped == Some(..)`)
-// while the sibling non-blob `Tag` table still compacts. The skip is gated by
-// `LANCE_SUPPORTS_BLOB_COMPACTION`; the surface guard
-// `compact_files_still_fails_on_blob_columns` flags when the upstream Lance fix
-// makes the skip (and this test's blob arm) removable.
+// History: through Lance 7.0.0 `compact_files` mis-decoded blob-v2 columns, so
+// `optimize` skipped blob tables (`SkipReason::BlobColumnsUnsupportedByLance`)
+// behind `LANCE_SUPPORTS_BLOB_COMPACTION`. Lance 8.0.0+ compacts blob-v2
+// correctly (upstream #7017/#7618), the gate and skip were removed at the
+// 9.0.0-beta.15 bump, and this test now pins the POSITIVE contract: a
+// multi-fragment blob table compacts in the same sweep as its non-blob
+// sibling, is published, and its rows survive. The surface-guard twin is
+// `lance_surface_guards.rs::compact_files_succeeds_on_blob_columns`.
 #[tokio::test]
-async fn optimize_skips_blob_table_and_reports_skip() {
+async fn optimize_compacts_blob_table_alongside_plain_table() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    // One Blob node type (`Doc`) + one plain node type (`Tag`): proves the blob
-    // table is skipped while a non-blob table in the same sweep still compacts.
+    // One Blob node type (`Doc`) + one plain node type (`Tag`): proves both use
+    // the normal compaction path in the same sweep.
     let schema = "\
 node Doc {\n    slug: String @key\n    content: Blob\n}\n\
 node Tag {\n    slug: String @key\n}\n";
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
 
     // Multi-fragment blob table: Overwrite creates fragment 1; each Merge of
-    // new keys appends another. A >=2-fragment blob table is exactly what
-    // crashes `compact_files` today (single fragment would no-op and not crash).
+    // new keys appends another. A >=2-fragment blob table exercises the rewrite
+    // path that exposed the historical Lance regression (a single fragment
+    // would be a no-op).
     load_jsonl(
         &mut db,
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"content\":\"base64:aGVsbG8x\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"content\":\"base64:aGVsbG8y\"}}",
@@ -264,6 +509,13 @@ node Tag {\n    slug: String @key\n}\n";
     .await
     .unwrap();
 
+    let commits_before = db.list_commits(None).await.unwrap();
+    let head_before = commits_before
+        .last()
+        .expect("seeded graph has a lineage head")
+        .graph_commit_id
+        .clone();
+
     let stats = db
         .optimize()
         .await
@@ -277,17 +529,37 @@ node Tag {\n    slug: String @key\n}\n";
         .iter()
         .find(|s| s.table_key == "node:Tag")
         .expect("Tag stat present");
-    // The blob table is skipped (and reported), not compacted.
-    assert_eq!(
-        doc.skipped,
-        Some(SkipReason::BlobColumnsUnsupportedByLance),
-        "blob table must be reported as skipped",
+    // The blob table compacts like any other (Lance 8+ blob-v2 compaction).
+    assert_eq!(doc.skipped, None, "blob table must no longer be skipped");
+    assert!(doc.committed, "blob table compaction must be published");
+    assert!(
+        doc.fragments_removed >= 2 && doc.fragments_added >= 1,
+        "expected a real rewrite of the multi-fragment blob table, got \
+         removed={} added={}",
+        doc.fragments_removed,
+        doc.fragments_added
     );
-    assert!(!doc.committed, "skipped blob table is not compacted");
-    assert_eq!(doc.fragments_removed, 0);
-    assert_eq!(doc.fragments_added, 0);
-    // The plain (non-blob) table is unaffected by the skip.
     assert_eq!(tag.skipped, None, "non-blob table must not be skipped");
+    assert!(tag.committed, "plain table compaction must be published");
+
+    // Both productive tables share one graph visibility point. Physical
+    // __manifest compaction below may add Lance versions, so lineage is the
+    // stable counter for the public Optimize contract.
+    let commits_after = db.list_commits(None).await.unwrap();
+    assert_eq!(
+        commits_after.len(),
+        commits_before.len() + 1,
+        "one graph-wide Optimize must publish one lineage commit even when two tables move"
+    );
+    assert_eq!(
+        commits_after.last().unwrap().parent_commit_id.as_deref(),
+        Some(head_before.as_str()),
+        "the graph-wide Optimize commit must extend the prior head"
+    );
+
+    // Every blob row survives the rewrite and stays readable.
+    let count = count_rows(&db, "node:Doc").await;
+    assert_eq!(count, 4, "all blob rows must survive compaction");
 }
 
 // Regression: `optimize` must publish its compaction to the `__manifest` so the
@@ -620,7 +892,7 @@ async fn delete_only_mutation_refuses_uncovered_drift_before_inline_commit() {
         &mixed_params(&[("$name", "Alice")], &[]),
     )
     .await
-    .expect_err("strict delete must reject uncovered drift before delete_where");
+    .expect_err("strict delete must reject uncovered drift before staging the delete");
     assert!(
         err.to_string().contains("expected"),
         "delete should fail as a strict stale-version write; got: {err}"
@@ -630,13 +902,139 @@ async fn delete_only_mutation_refuses_uncovered_drift_before_inline_commit() {
     assert_eq!(manifest_after, manifest_before);
     assert_eq!(
         head_after, head_before,
-        "delete_where must not run after the strict drift guard fails"
+        "the staged delete must not commit after the strict drift guard fails"
     );
     assert_eq!(
         count_rows(&db, "node:Person").await,
         8,
         "manifest-pinned reads should still see all rows present before the failed delete"
     );
+}
+
+fn recovery_sidecar_count(dir: &tempfile::TempDir) -> usize {
+    let recovery = dir.path().join("__recovery");
+    if !recovery.exists() {
+        return 0;
+    }
+    std::fs::read_dir(recovery).unwrap().count()
+}
+
+#[tokio::test]
+async fn schema_apply_refuses_uncovered_drift_before_arming_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let mut db = init_and_load(&dir).await;
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+    let desired = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+
+    let err = db
+        .apply_schema(&desired)
+        .await
+        .expect_err("schema apply must not claim or fold uncovered table drift");
+    assert!(
+        err.to_string().contains("omnigraph repair"),
+        "error should direct the operator to repair; got: {err}"
+    );
+    assert_eq!(
+        recovery_sidecar_count(&dir),
+        0,
+        "a pre-existing effect must be rejected before SchemaApply writes its sidecar"
+    );
+
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, manifest_before);
+    assert_eq!(head_after, head_before);
+}
+
+#[tokio::test]
+async fn ensure_indices_refuses_uncovered_drift_before_arming_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let (manifest_before, head_before, _) = forge_person_delete_drift(&db, &root).await;
+
+    let err = db
+        .ensure_indices()
+        .await
+        .expect_err("index reconciliation must not claim or fold uncovered table drift");
+    assert!(
+        err.to_string().contains("omnigraph repair"),
+        "error should direct the operator to repair; got: {err}"
+    );
+    assert_eq!(
+        recovery_sidecar_count(&dir),
+        0,
+        "a pre-existing effect must be rejected before EnsureIndices writes its sidecar"
+    );
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, manifest_before);
+    assert_eq!(head_after, head_before);
+
+    db.repair(RepairOptions {
+        confirm: true,
+        force: true,
+    })
+    .await
+    .expect("explicit repair should remain available after the refusal");
+    db.ensure_indices()
+        .await
+        .expect("index reconciliation should succeed once repair establishes ownership");
+}
+
+#[tokio::test]
+async fn branch_merge_refuses_uncovered_target_drift_before_arming_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let mut db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "feature-only")], &[("$age", 39)]),
+    )
+    .await
+    .unwrap();
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+
+    let err = db
+        .branch_merge("feature", "main")
+        .await
+        .expect_err("branch merge must not claim or fold uncovered target drift");
+    assert!(
+        err.to_string().contains("omnigraph repair"),
+        "error should direct the operator to repair; got: {err}"
+    );
+    assert_eq!(
+        recovery_sidecar_count(&dir),
+        0,
+        "a pre-existing effect must be rejected before BranchMerge writes its sidecar"
+    );
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, manifest_before);
+    assert_eq!(head_after, head_before);
 }
 
 // Regression: `optimize` must REFUSE when an unresolved recovery sidecar is
@@ -708,7 +1106,9 @@ async fn cleanup_without_any_policy_option_errors() {
 #[tokio::test]
 async fn cleanup_keep_one_preserves_head_and_table_remains_readable() {
     let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
     let mut db = init_and_load(&dir).await;
+    add_person_fragments(&mut db).await;
 
     let people_before = count_rows(&db, "node:Person").await;
     assert!(
@@ -716,9 +1116,21 @@ async fn cleanup_keep_one_preserves_head_and_table_remains_readable() {
         "fixture should seed Person rows for this test to be meaningful"
     );
 
-    // Most aggressive version-based cleanup short of forcing keep=0. Lance's
-    // contract is that head is always preserved regardless, so the table
-    // must remain openable and rows must still be visible.
+    let person_uri = node_table_uri(&uri, "Person");
+    assert!(
+        Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .versions()
+            .await
+            .unwrap()
+            .len()
+            > 1,
+        "precondition: Person must have history to collect"
+    );
+
+    // Most aggressive version-based cleanup short of forcing keep=0. `keep`
+    // is exact over the available version list, not HEAD arithmetic.
     let _stats = db
         .cleanup(CleanupPolicyOptions {
             keep_versions: Some(1),
@@ -728,6 +1140,52 @@ async fn cleanup_keep_one_preserves_head_and_table_remains_readable() {
         .unwrap();
 
     assert_eq!(count_rows(&db, "node:Person").await, people_before);
+    assert_eq!(
+        Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .versions()
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "keep=1 must retain exactly the latest available version"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_keep_exceeding_history_preserves_every_available_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+    let person_uri = node_table_uri(&uri, "Person");
+    let before = Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+    assert!(before > 1, "fixture must contain version history");
+
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(10),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+
+    let after = Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(
+        after, before,
+        "keep greater than available history must not become an unbounded cleanup"
+    );
 }
 
 #[tokio::test]
@@ -751,6 +1209,224 @@ async fn cleanup_older_than_zero_preserves_head() {
     load_jsonl(&mut db, TEST_DATA, LoadMode::Merge)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn cleanup_preserves_main_version_pinned_by_live_lazy_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    db.branch_create("feature").await.unwrap();
+    let feature_before = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+    let feature_person = feature_before.entry("node:Person").unwrap();
+    assert_eq!(
+        feature_person.table_branch, None,
+        "precondition: Person must still be inherited lazily from main"
+    );
+    let pinned_main_version = feature_person.table_version;
+    let feature_people_before = count_rows_branch(&db, "feature", "node:Person").await;
+
+    // Move main far enough that keep=1 would collect the version inherited by
+    // the lazy branch unless cleanup accounts for graph-level branch pins.
+    add_person_fragments(&mut db).await;
+    let main_person_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+    assert!(
+        pinned_main_version < main_person_version.saturating_sub(1),
+        "precondition: lazy-branch pin must fall outside keep=1 retention"
+    );
+
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        count_rows_branch(&db, "feature", "node:Person").await,
+        feature_people_before,
+        "cleanup must preserve the exact main-table version inherited by a live lazy branch"
+    );
+
+    // The same floor must constrain a time-only policy. Lance combines the
+    // timestamp and version predicates with AND, so injecting the branch pin
+    // as `before_version` keeps the inherited version even when every old
+    // manifest satisfies the timestamp cutoff.
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: None,
+        older_than: Some(Duration::from_secs(0)),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        count_rows_branch(&db, "feature", "node:Person").await,
+        feature_people_before,
+        "time-only cleanup must honor the same live lazy-branch floor"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_uses_oldest_pin_across_multiple_live_lazy_branches() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    db.branch_create("a-old").await.unwrap();
+    let old_rows = count_rows_branch(&db, "a-old", "node:Person").await;
+    add_person_fragments(&mut db).await;
+    db.branch_create("z-new").await.unwrap();
+    let new_rows = count_rows_branch(&db, "z-new", "node:Person").await;
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Ivan")], &[("$age", 44)]),
+    )
+    .await
+    .unwrap();
+
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        count_rows_branch(&db, "a-old", "node:Person").await,
+        old_rows,
+        "the oldest live pin must win over later branch pins"
+    );
+    assert_eq!(
+        count_rows_branch(&db, "z-new", "node:Person").await,
+        new_rows,
+        "newer lazy pins must remain readable too"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_fails_closed_when_live_lazy_branch_pin_is_unopenable() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+
+    db.branch_create("feature").await.unwrap();
+    let pinned_main_version = db
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+    add_person_fragments(&mut db).await;
+
+    // Simulate damage created by an older cleanup implementation: raw Lance
+    // sees no native Person branch for the lazy graph branch and removes its
+    // inherited main manifest.
+    let person_uri = node_table_uri(&uri, "Person");
+    let ds = Dataset::open(&person_uri).await.unwrap();
+    let head = ds.version().version;
+    assert!(pinned_main_version < head, "precondition: main advanced");
+    let removed = lance::dataset::cleanup::cleanup_old_versions(
+        &ds,
+        lance::dataset::cleanup::CleanupPolicy {
+            before_timestamp: None,
+            before_version: Some(head),
+            delete_unverified: false,
+            error_if_tagged_old_versions: false,
+            clean_referenced_branches: false,
+            delete_rate_limit: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        removed.old_versions > 0,
+        "precondition: raw Lance cleanup removed old main versions"
+    );
+    let company_uri = node_table_uri(&uri, "Company");
+    let company_versions_before = Dataset::open(&company_uri)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+
+    let err = db
+        .cleanup(CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .expect_err("cleanup must fail closed when a live lazy pin cannot be opened");
+    let message = err.to_string();
+    assert!(
+        message.contains("could not classify live branch 'feature'")
+            && message.contains("node:Person"),
+        "error must identify the unclassifiable live reference; got: {message}"
+    );
+    assert_eq!(
+        Dataset::open(&company_uri)
+            .await
+            .unwrap()
+            .versions()
+            .await
+            .unwrap()
+            .len(),
+        company_versions_before,
+        "the graph-wide preflight must fail before any unrelated table GC"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_refuses_uncovered_main_head_drift_before_any_version_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+    let (manifest_version, head_version, _) = forge_person_compaction_drift(&mut db, &root).await;
+    let company_uri = node_table_uri(&root, "Company");
+    let company_versions_before = Dataset::open(&company_uri)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+
+    let err = db
+        .cleanup(CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .expect_err("cleanup must not garbage-collect around uncovered HEAD drift");
+    let message = err.to_string();
+    assert!(
+        message.contains("uncovered HEAD drift")
+            && message.contains("node:Person")
+            && message.contains("repair"),
+        "drift refusal must be actionable; got: {message}"
+    );
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, manifest_version);
+    assert_eq!(head_after, head_version);
+    assert_eq!(
+        Dataset::open(&company_uri)
+            .await
+            .unwrap()
+            .versions()
+            .await
+            .unwrap()
+            .len(),
+        company_versions_before,
+        "drift preflight must abort before unrelated table history is collected"
+    );
 }
 
 #[tokio::test]
@@ -915,15 +1591,12 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
 }
 
 // Regression (iss-848): a table with rows but NULL vectors (the load-before-
-// embed window) must not abort index building. The vector (IVF) index cannot
-// train on 0 vectors, so `create_vector_index` errors with "KMeans cannot
-// train 1 centroids with 0 vectors". `build_indices_on_dataset_for_catalog`
-// is the chokepoint every caller funnels through (load/mutate via
-// prepare_updates_for_commit, ensure_indices, optimize, schema apply, merge),
-// so per-index fault isolation there must defer that one column (pending) and
-// still build the sibling scalar indexes, instead of propagating the error.
-// This exercises both the load path (which builds indices inline) and the
-// ensure_indices reconciler. Pre-fix this fails at the load step.
+// embed window) must remain writable and reconcilable. RFC-022-enrolled writes
+// publish only their logical data effect; physical indexes are derived work.
+// The vector (IVF) index cannot train on 0 vectors, so the index chokepoint must
+// defer that column as pending while still building eligible sibling indexes.
+// This exercises both halves of the contract: the logical load succeeds without
+// inline index work, then `ensure_indices` tolerates the untrainable vector.
 #[tokio::test]
 async fn index_build_tolerates_null_vector_rows() {
     let dir = tempfile::tempdir().unwrap();
@@ -944,11 +1617,40 @@ async fn index_build_tolerates_null_vector_rows() {
     .await
     .expect("load rows with null embeddings");
 
-    // Must not abort: the untrainable vector column is deferred, the sibling
-    // BTREE on `n` still builds.
-    db.ensure_indices()
+    let before = snapshot_main(&db).await.unwrap();
+    let before_manifest_version = before.version();
+    let before_table_version = before.entry("node:Doc").unwrap().table_version;
+
+    // Must not abort: the untrainable vector column is deferred, while id,
+    // slug (FTS), and n (BTREE) are built together in one table transaction.
+    let pending = db
+        .ensure_indices()
         .await
         .expect("ensure_indices must not abort when a vector column has no trainable vectors yet");
+    assert_eq!(pending.len(), 1, "only the null vector index is pending");
+    assert_eq!(pending[0].table_key, "node:Doc");
+    assert_eq!(pending[0].column, "embedding");
+    assert_eq!(
+        pending[0].reason,
+        "column has no non-null vectors to train on yet"
+    );
+
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(
+        after.entry("node:Doc").unwrap().table_version,
+        before_table_version + 1,
+        "all buildable indexes for one table must land in one CreateIndex transaction"
+    );
+    assert_eq!(
+        after.version(),
+        before_manifest_version + 1,
+        "one reconciliation publishes exactly one graph commit"
+    );
+    let ds = after.open("node:Doc").await.unwrap();
+    assert!(ds.has_btree_index("id").await.unwrap());
+    assert!(ds.has_fts_index("slug").await.unwrap());
+    assert!(ds.has_btree_index("n").await.unwrap());
+    assert!(!ds.has_vector_index("embedding").await.unwrap());
 }
 
 // iss-848: `optimize` converges declared-but-unbuilt indexes. After an @index is
@@ -983,9 +1685,7 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
         let ds = snap.open("node:Doc").await.unwrap();
         assert!(
             matches!(
-                TableStore::key_column_index_coverage(&ds, "rank")
-                    .await
-                    .unwrap(),
+                ds.index_coverage("rank").await.unwrap(),
                 IndexCoverage::Degraded { .. }
             ),
             "rank must be unindexed after the deferred apply"
@@ -997,10 +1697,11 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
     // Postcondition: optimize's reconciler materialized the declared index.
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Doc").await.unwrap();
+    assert!(ds.has_btree_index("id").await.unwrap());
+    assert!(ds.has_fts_index("slug").await.unwrap());
+    assert!(ds.has_btree_index("rank").await.unwrap());
     assert_eq!(
-        TableStore::key_column_index_coverage(&ds, "rank")
-            .await
-            .unwrap(),
+        ds.index_coverage("rank").await.unwrap(),
         IndexCoverage::Indexed,
         "optimize must build the declared-but-unbuilt rank index"
     );
@@ -1041,9 +1742,7 @@ async fn optimize_materializes_index_after_type_rename() {
         let ds = snap.open("node:Item").await.unwrap();
         assert!(
             matches!(
-                TableStore::key_column_index_coverage(&ds, "rank")
-                    .await
-                    .unwrap(),
+                ds.index_coverage("rank").await.unwrap(),
                 IndexCoverage::Degraded { .. }
             ),
             "rank must be unindexed immediately after the rename"
@@ -1055,9 +1754,7 @@ async fn optimize_materializes_index_after_type_rename() {
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Item").await.unwrap();
     assert_eq!(
-        TableStore::key_column_index_coverage(&ds, "rank")
-            .await
-            .unwrap(),
+        ds.index_coverage("rank").await.unwrap(),
         IndexCoverage::Indexed,
         "optimize must build the renamed table's deferred rank index"
     );

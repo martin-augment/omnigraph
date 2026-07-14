@@ -566,6 +566,19 @@ pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             schema_type_kind_label(*type_kind),
             type_name
         ),
+        SchemaMigrationStep::ExtendEnum {
+            type_kind,
+            type_name,
+            property_name,
+            added_values,
+        } => format!(
+            "extend enum '{}.{}' (+{}) on {} '{}'",
+            type_name,
+            property_name,
+            added_values.join(", +"),
+            schema_type_kind_label(*type_kind),
+            type_name
+        ),
         SchemaMigrationStep::UpdateTypeMetadata {
             type_kind,
             name,
@@ -732,9 +745,15 @@ pub(crate) fn print_embed_human(output: &EmbedOutput) {
     );
 }
 
-pub(crate) fn print_snapshot_human(branch: &str, manifest_version: u64, entries: &[SnapshotTableOutput]) {
+pub(crate) fn print_snapshot_human(
+    branch: &str,
+    manifest_version: u64,
+    internal_schema_version: u32,
+    entries: &[SnapshotTableOutput],
+) {
     println!("branch: {}", branch);
     println!("manifest_version: {}", manifest_version);
+    println!("internal_schema_version: {}", internal_schema_version);
     for entry in entries {
         println!(
             "{} v{} branch={} rows={}",
@@ -849,6 +868,13 @@ pub(crate) struct QueriesListItem {
     pub(crate) mcp_expose: bool,
     pub(crate) tool_name: Option<String>,
     pub(crate) mutation: bool,
+    /// `@description` from the query declaration — what the query is for.
+    /// Carried so the CLI catalog matches the HTTP `GET /queries` surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
+    /// `@instruction` from the query declaration — how/when to invoke it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) instruction: Option<String>,
     pub(crate) params: Vec<QueriesParam>,
 }
 

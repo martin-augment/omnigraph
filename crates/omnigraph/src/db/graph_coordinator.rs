@@ -6,15 +6,14 @@ use omnigraph_compiler::catalog::Catalog;
 
 use crate::error::{OmniError, Result};
 use crate::failpoints;
-use crate::storage::{StorageAdapter, join_uri, normalize_root_uri};
+use crate::storage::{StorageAdapter, normalize_root_uri};
 
 use super::commit_graph::{CommitGraph, GraphCommit};
 use super::is_internal_system_branch;
 use super::manifest::{
-    ManifestChange, ManifestCoordinator, ManifestIncarnation, Snapshot, SubTableUpdate,
+    LineageIntent, ManifestChange, ManifestCoordinator, ManifestIncarnation, PublishPrecondition,
+    Snapshot, SubTableUpdate,
 };
-
-const GRAPH_COMMITS_DIR: &str = "_graph_commits.lance";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SnapshotId(String);
@@ -91,23 +90,27 @@ pub(crate) struct PublishedSnapshot {
     pub _snapshot_id: SnapshotId,
 }
 
-pub struct GraphCoordinator {
+pub(crate) struct GraphCoordinator {
     root_uri: String,
     storage: Arc<dyn StorageAdapter>,
     manifest: ManifestCoordinator,
-    commit_graph: Option<CommitGraph>,
+    commit_graph: CommitGraph,
     bound_branch: Option<String>,
 }
 
 impl GraphCoordinator {
-    pub async fn init(
+    pub(crate) async fn init(
         root_uri: &str,
         catalog: &Catalog,
         storage: Arc<dyn StorageAdapter>,
     ) -> Result<Self> {
         let root = normalize_root_uri(root_uri)?;
+        // The genesis graph commit is folded into the manifest init write, so
+        // `__manifest` is the single source of graph lineage from version one
+        // (RFC-013 Phase 7). `CommitGraph::init` then seeds its cache from that
+        // manifest genesis — it opens no Lance dataset (Phase B).
         let manifest = ManifestCoordinator::init(&root, catalog).await?;
-        let commit_graph = Some(CommitGraph::init(&root, manifest.version()).await?);
+        let commit_graph = CommitGraph::init(&root).await?;
         Ok(Self {
             root_uri: root,
             storage,
@@ -120,11 +123,7 @@ impl GraphCoordinator {
     pub async fn open(root_uri: &str, storage: Arc<dyn StorageAdapter>) -> Result<Self> {
         let root = normalize_root_uri(root_uri)?;
         let manifest = ManifestCoordinator::open(&root).await?;
-        let commit_graph = if storage.exists(&graph_commits_uri(&root)).await? {
-            Some(CommitGraph::open(&root).await?)
-        } else {
-            None
-        };
+        let commit_graph = CommitGraph::open(&root).await?;
         Ok(Self {
             root_uri: root,
             storage,
@@ -146,11 +145,7 @@ impl GraphCoordinator {
 
         let root = normalize_root_uri(root_uri)?;
         let manifest = ManifestCoordinator::open_at_branch(&root, &branch_name).await?;
-        let commit_graph = if storage.exists(&graph_commits_uri(&root)).await? {
-            Some(CommitGraph::open_at_branch(&root, &branch_name).await?)
-        } else {
-            None
-        };
+        let commit_graph = CommitGraph::open_at_branch(&root, &branch_name).await?;
 
         Ok(Self {
             root_uri: root,
@@ -173,6 +168,20 @@ impl GraphCoordinator {
         self.manifest.incarnation()
     }
 
+    /// Lance-native identity of the active `__manifest` branch. Stable across
+    /// commits; changes when a named branch is deleted and recreated.
+    pub(crate) async fn branch_identifier(&self) -> Result<lance::dataset::refs::BranchIdentifier> {
+        self.manifest.branch_identifier().await
+    }
+
+    /// Exact `graph_head:<active-branch>` pointer, preserving `None` for a
+    /// freshly-created named branch even though its inherited commit history has
+    /// an inferred head. Sourced from the manifest coordinator's SAME pinned
+    /// state as [`Self::snapshot`], not the separately refreshed lineage cache.
+    pub(crate) fn exact_graph_head(&self) -> Option<String> {
+        self.manifest.exact_graph_head()
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.manifest.snapshot()
     }
@@ -183,9 +192,7 @@ impl GraphCoordinator {
 
     pub async fn refresh(&mut self) -> Result<()> {
         self.manifest.refresh().await?;
-        if let Some(commit_graph) = &mut self.commit_graph {
-            commit_graph.refresh().await?;
-        }
+        self.commit_graph.refresh().await?;
         Ok(())
     }
 
@@ -227,52 +234,18 @@ impl GraphCoordinator {
             })
     }
 
-    pub async fn branch_create(&mut self, name: &str) -> Result<()> {
+    pub(crate) async fn branch_create(&mut self, name: &str) -> Result<()> {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
-        self.ensure_commit_graph_initialized().await?;
 
-        // Manifest authority flip first.
-        self.manifest.create_branch(&branch).await?;
-
-        // Derived commit-graph branch. If anything after the authority flip
-        // fails, roll back the manifest branch so the branch never half-exists
-        // (a manifest branch with no commit-graph branch breaks the next write).
-        if let Err(err) = self.create_commit_graph_branch(&branch).await {
-            if let Err(rollback_err) = self.manifest.delete_branch(&branch).await {
-                tracing::warn!(
-                    target: "omnigraph::branch_create",
-                    branch = %branch,
-                    error = %rollback_err,
-                    "rollback of manifest branch failed after commit-graph create failure",
-                );
-            }
-            return Err(err);
-        }
-        Ok(())
+        // Manifest BranchContents is the single branch authority. Lance creates
+        // it in two physical phases (shallow clone, then BranchContents); the
+        // manifest coordinator classifies/reclaims a clone-only zombie before
+        // a bounded retry. No graph-lineage branch is created or rolled back.
+        self.manifest.create_branch(&branch).await
     }
 
-    /// Create the derived commit-graph branch for `branch`, healing a zombie ref
-    /// left by an incomplete prior delete. The manifest branch was just created
-    /// fresh, so any existing commit-graph branch with this name is provably
-    /// orphaned and is force-dropped before recreating.
-    async fn create_commit_graph_branch(&mut self, branch: &str) -> Result<()> {
-        failpoints::maybe_fail("branch_create.after_manifest_branch_create")?;
-        let Some(commit_graph) = &mut self.commit_graph else {
-            return Ok(());
-        };
-        if commit_graph
-            .list_branches()
-            .await?
-            .iter()
-            .any(|existing| existing == branch)
-        {
-            commit_graph.force_delete_branch(branch).await?;
-        }
-        commit_graph.create_branch(branch).await
-    }
-
-    pub async fn branch_delete(&mut self, name: &str) -> Result<()> {
+    pub(crate) async fn branch_delete(&mut self, name: &str) -> Result<()> {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
         if self.current_branch() == Some(branch.as_str()) {
@@ -282,43 +255,12 @@ impl GraphCoordinator {
             )));
         }
 
-        // Manifest authority flip — the single atomic op that makes the branch
-        // cease to exist. Must succeed; everything after is derived state
-        // reclaimed best-effort.
-        self.manifest.delete_branch(&branch).await?;
-
-        // Commit-graph branch is derived state. Reclaim best-effort with the
-        // idempotent force variant: a failure here (or a missing dataset) is
-        // reconciled by `cleanup` and must not fail the delete after the
-        // authority already flipped.
-        if let Err(err) = self.reclaim_commit_graph_branch(&branch).await {
-            tracing::warn!(
-                target: "omnigraph::branch_delete::cleanup",
-                branch = %branch,
-                error = %err,
-                "best-effort commit-graph branch reclaim failed; cleanup will reconcile",
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Best-effort, idempotent reclaim of the commit-graph branch `branch`.
-    /// Tolerates an absent commit-graph dataset (a graph that never committed).
-    async fn reclaim_commit_graph_branch(&mut self, branch: &str) -> Result<()> {
-        failpoints::maybe_fail("branch_delete.before_commit_graph_reclaim")?;
-        if let Some(commit_graph) = &mut self.commit_graph {
-            commit_graph.force_delete_branch(branch).await
-        } else if self
-            .storage
-            .exists(&graph_commits_uri(self.root_uri()))
-            .await?
-        {
-            let mut commit_graph = CommitGraph::open(self.root_uri()).await?;
-            commit_graph.force_delete_branch(branch).await
-        } else {
-            Ok(())
-        }
+        // Removing manifest BranchContents is the logical visibility point.
+        // Lance reclaims the branch tree afterward, so an error may still mean
+        // logical deletion succeeded; the manifest coordinator reclassifies
+        // that outcome from fresh authority. Per-table data forks remain
+        // derived state and are reclaimed by the engine afterward.
+        self.manifest.delete_branch(&branch).await
     }
 
     pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot> {
@@ -394,20 +336,13 @@ impl GraphCoordinator {
     }
 
     pub async fn resolve_commit(&self, snapshot_id: &SnapshotId) -> Result<GraphCommit> {
-        if let Some(commit_graph) = &self.commit_graph {
-            if let Some(commit) = commit_graph.get_commit(snapshot_id.as_str()) {
-                return Ok(commit);
-            }
+        if let Some(commit) = self.commit_graph.get_commit(snapshot_id.as_str()) {
+            return Ok(commit);
         }
 
         for branch in self.manifest.list_branches().await? {
             let normalized = normalize_branch_name(&branch)?;
-            let Some(commit_graph) = self
-                .open_commit_graph_for_branch(normalized.as_deref())
-                .await?
-            else {
-                break;
-            };
+            let commit_graph = self.open_commit_graph_for_branch(normalized.as_deref()).await?;
             if let Some(commit) = commit_graph.get_commit(snapshot_id.as_str()) {
                 return Ok(commit);
             }
@@ -420,44 +355,20 @@ impl GraphCoordinator {
     }
 
     pub(crate) async fn head_commit_id(&self) -> Result<Option<SnapshotId>> {
-        match &self.commit_graph {
-            Some(commit_graph) => commit_graph
-                .head_commit_id()
-                .await
-                .map(|id| id.map(SnapshotId::new)),
-            None => Ok(None),
-        }
+        self.commit_graph
+            .head_commit_id()
+            .await
+            .map(|id| id.map(SnapshotId::new))
     }
 
-    pub(crate) async fn ensure_commit_graph_initialized(&mut self) -> Result<()> {
-        if self.commit_graph.is_some() {
-            return Ok(());
-        }
-        if !self
-            .storage
-            .exists(&graph_commits_uri(self.root_uri()))
-            .await?
-        {
-            let _ = CommitGraph::init(self.root_uri(), self.manifest.version()).await?;
-        }
-        self.commit_graph = match self.current_branch() {
-            Some(branch) => Some(CommitGraph::open_at_branch(self.root_uri(), branch).await?),
-            None => Some(CommitGraph::open(self.root_uri()).await?),
-        };
-        Ok(())
-    }
-
+    #[cfg(test)]
     pub(crate) async fn commit_updates_with_actor(
         &mut self,
         updates: &[SubTableUpdate],
         actor_id: Option<&str>,
     ) -> Result<PublishedSnapshot> {
-        let manifest_version = self.commit_manifest_updates(updates).await?;
-        let snapshot_id = self.record_graph_commit(manifest_version, actor_id).await?;
-        Ok(PublishedSnapshot {
-            manifest_version,
-            _snapshot_id: snapshot_id,
-        })
+        self.commit_updates_with_actor_with_expected(updates, &HashMap::new(), actor_id)
+            .await
     }
 
     /// Commit with publisher-level OCC fence. The `expected_table_versions` map
@@ -471,158 +382,123 @@ impl GraphCoordinator {
         expected_table_versions: &HashMap<String, u64>,
         actor_id: Option<&str>,
     ) -> Result<PublishedSnapshot> {
-        let manifest_version = self
-            .commit_manifest_updates_with_expected(updates, expected_table_versions)
-            .await?;
-        let snapshot_id = self.record_graph_commit(manifest_version, actor_id).await?;
-        Ok(PublishedSnapshot {
-            manifest_version,
-            _snapshot_id: snapshot_id,
-        })
+        let changes = updates_to_changes(updates);
+        self.commit_changes_with_actor_with_expected(&changes, expected_table_versions, actor_id)
+            .await
     }
 
-    pub(crate) async fn commit_manifest_updates(
+    /// Publish `changes` and record one graph commit in the SAME manifest CAS
+    /// (RFC-013 Phase 7). The lineage intent (a freshly minted commit id, the
+    /// branch, the actor) rides the publish so the `graph_commit` + `graph_head`
+    /// rows land atomically with the table-version rows — one manifest version,
+    /// no separate write, no `commit_graph.refresh()` to pick a parent (the
+    /// publisher resolves it under the CAS). The in-memory commit cache is then
+    /// updated from the intent + the resolved parent without a re-read.
+    async fn commit_changes_with_actor_with_expected(
         &mut self,
-        updates: &[SubTableUpdate],
-    ) -> Result<u64> {
-        let manifest_version = self.manifest.commit(updates).await?;
-        failpoints::maybe_fail("graph_publish.after_manifest_commit")?;
-        Ok(manifest_version)
-    }
-
-    pub(crate) async fn commit_manifest_updates_with_expected(
-        &mut self,
-        updates: &[SubTableUpdate],
+        changes: &[ManifestChange],
         expected_table_versions: &HashMap<String, u64>,
-    ) -> Result<u64> {
-        let manifest_version = self
-            .manifest
-            .commit_with_expected(updates, expected_table_versions)
-            .await?;
-        failpoints::maybe_fail("graph_publish.after_manifest_commit")?;
-        Ok(manifest_version)
-    }
-
-    pub(crate) async fn commit_manifest_changes(
-        &mut self,
-        changes: &[ManifestChange],
-    ) -> Result<u64> {
-        let manifest_version = self.manifest.commit_changes(changes).await?;
-        failpoints::maybe_fail("graph_publish.after_manifest_commit")?;
-        Ok(manifest_version)
-    }
-
-    pub(crate) async fn commit_changes_with_actor(
-        &mut self,
-        changes: &[ManifestChange],
         actor_id: Option<&str>,
     ) -> Result<PublishedSnapshot> {
-        let manifest_version = self.commit_manifest_changes(changes).await?;
-        let snapshot_id = self.record_graph_commit(manifest_version, actor_id).await?;
+        let intent = self.new_lineage_intent(actor_id, None)?;
+        self.commit_changes_with_intent_and_expected(
+            changes,
+            expected_table_versions,
+            intent,
+            &PublishPrecondition::Any,
+        )
+        .await
+    }
+
+    /// Publish a pre-minted lineage intent under an explicit authority
+    /// precondition. The intent's identity and timestamp remain stable across
+    /// publisher retries and can also be persisted by the caller's recovery
+    /// protocol before this method is invoked.
+    pub(crate) async fn commit_changes_with_intent_and_expected(
+        &mut self,
+        changes: &[ManifestChange],
+        expected_table_versions: &HashMap<String, u64>,
+        intent: LineageIntent,
+        precondition: &PublishPrecondition,
+    ) -> Result<PublishedSnapshot> {
+        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
+        let outcome = self
+            .manifest
+            .commit_changes_with_lineage_and_precondition(
+                changes,
+                expected_table_versions,
+                Some(&intent),
+                precondition,
+            )
+            .await?;
+        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
+        let snapshot_id = self.apply_lineage_to_cache(intent, &outcome);
         Ok(PublishedSnapshot {
-            manifest_version,
+            manifest_version: outcome.version,
             _snapshot_id: snapshot_id,
         })
     }
 
-    pub(crate) async fn record_graph_commit(
-        &mut self,
-        manifest_version: u64,
-        actor_id: Option<&str>,
-    ) -> Result<SnapshotId> {
-        self.ensure_commit_graph_initialized().await?;
-        let current_branch = self.current_branch().map(str::to_string);
-        let Some(commit_graph) = &mut self.commit_graph else {
-            return Ok(SnapshotId::synthetic(
-                current_branch.as_deref(),
-                manifest_version,
-                self.manifest_incarnation().e_tag.as_deref(),
-            ));
-        };
-        failpoints::maybe_fail("graph_publish.before_commit_append")?;
-        // Refresh the commit-graph head from storage before selecting the
-        // parent. `append_commit` parents the new commit on the IN-MEMORY head
-        // (`head_commit_id`, zero storage read), but the manifest was just
-        // committed against a freshly rebased pin (`commit_all` opens a fresh
-        // coordinator) while THIS coordinator's cached head may be stale because
-        // an external writer advanced the branch. Without this refresh a
-        // same-branch write after an external commit appends off the stale head
-        // and FORKS the commit DAG (the new commit and the external commit
-        // sharing a parent). Refreshing makes the parent the true current head;
-        // the just-committed manifest version has no commit-graph row yet, so the
-        // fresh head is exactly the prior commit. (record_merge_commit is
-        // unaffected — it passes explicit parents, never the cached head.)
-        commit_graph.refresh().await?;
-        let graph_commit_id = commit_graph
-            .append_commit(current_branch.as_deref(), manifest_version, actor_id)
-            .await?;
-        Ok(SnapshotId::new(graph_commit_id))
-    }
-
-    pub(crate) async fn record_merge_commit(
-        &mut self,
-        manifest_version: u64,
-        parent_commit_id: &str,
-        merged_parent_commit_id: &str,
-        actor_id: Option<&str>,
-    ) -> Result<SnapshotId> {
-        self.ensure_commit_graph_initialized().await?;
-        let current_branch = self.current_branch().map(str::to_string);
-        let commit_graph = self.commit_graph.as_mut().ok_or_else(|| {
-            OmniError::manifest("branch merge requires _graph_commits.lance".to_string())
-        })?;
-        failpoints::maybe_fail("graph_publish.before_commit_append")?;
-        let graph_commit_id = commit_graph
-            .append_merge_commit(
-                current_branch.as_deref(),
-                manifest_version,
-                parent_commit_id,
-                merged_parent_commit_id,
-                actor_id,
-            )
-            .await?;
-        Ok(SnapshotId::new(graph_commit_id))
-    }
-
-    async fn open_commit_graph_for_branch(
+    /// Mint a [`LineageIntent`] for the next commit on the current branch: a
+    /// fresh ULID (stable across the publisher's CAS retries) and a timestamp.
+    /// The parent is NOT chosen here — the publisher resolves it per attempt
+    /// against the manifest it commits against.
+    pub(crate) fn new_lineage_intent(
         &self,
-        branch: Option<&str>,
-    ) -> Result<Option<CommitGraph>> {
-        if !self
-            .storage
-            .exists(&graph_commits_uri(self.root_uri()))
-            .await?
-        {
-            return Ok(None);
-        }
-        let graph = match branch {
-            Some(branch) => CommitGraph::open_at_branch(self.root_uri(), branch).await?,
-            None => CommitGraph::open(self.root_uri()).await?,
+        actor_id: Option<&str>,
+        merged_parent_commit_id: Option<String>,
+    ) -> Result<LineageIntent> {
+        Ok(LineageIntent {
+            graph_commit_id: ulid::Ulid::new().to_string(),
+            branch: self.current_branch().map(str::to_string),
+            actor_id: actor_id.map(str::to_string),
+            merged_parent_commit_id,
+            created_at: crate::db::now_micros()?,
+        })
+    }
+
+    /// Insert the just-published commit into the in-memory commit cache from the
+    /// intent + the publisher-resolved parent + the new manifest version. No
+    /// storage I/O: the durable write already happened in the publish CAS, and
+    /// this keeps a same-handle read's `head_commit_id` consistent with the
+    /// snapshot it just advanced.
+    fn apply_lineage_to_cache(
+        &mut self,
+        intent: crate::db::manifest::LineageIntent,
+        outcome: &crate::db::manifest::CommitOutcome,
+    ) -> SnapshotId {
+        let commit = GraphCommit {
+            graph_commit_id: intent.graph_commit_id.clone(),
+            manifest_branch: intent.branch,
+            manifest_version: outcome.version,
+            parent_commit_id: outcome.parent_commit_id.clone(),
+            merged_parent_commit_id: intent.merged_parent_commit_id,
+            actor_id: intent.actor_id,
+            created_at: intent.created_at,
         };
-        Ok(Some(graph))
+        self.commit_graph.insert_committed(commit);
+        SnapshotId::new(intent.graph_commit_id)
+    }
+
+    async fn open_commit_graph_for_branch(&self, branch: Option<&str>) -> Result<CommitGraph> {
+        match branch {
+            Some(branch) => CommitGraph::open_at_branch(self.root_uri(), branch).await,
+            None => CommitGraph::open(self.root_uri()).await,
+        }
     }
 
     pub(crate) async fn list_commits(&self) -> Result<Vec<GraphCommit>> {
-        if let Some(commit_graph) = &self.commit_graph {
-            return commit_graph.load_commits().await;
-        }
-        if !self
-            .storage
-            .exists(&graph_commits_uri(self.root_uri()))
-            .await?
-        {
-            return Ok(Vec::new());
-        }
-        let commit_graph = match self.current_branch() {
-            Some(branch) => CommitGraph::open_at_branch(self.root_uri(), branch).await?,
-            None => CommitGraph::open(self.root_uri()).await?,
-        };
-        commit_graph.load_commits().await
+        self.commit_graph.load_commits().await
     }
 }
 
-fn graph_commits_uri(root_uri: &str) -> String {
-    join_uri(root_uri, GRAPH_COMMITS_DIR)
+/// Wrap each `SubTableUpdate` as a `ManifestChange::Update` for the publisher.
+fn updates_to_changes(updates: &[SubTableUpdate]) -> Vec<ManifestChange> {
+    updates
+        .iter()
+        .cloned()
+        .map(ManifestChange::Update)
+        .collect()
 }
 
 fn normalize_branch_name(branch: &str) -> Result<Option<String>> {

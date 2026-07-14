@@ -19,6 +19,7 @@ demo/*.omni/
 /docs/internal
 
 # Local-only working files (not for the public repo)
+/archived/
 .claude/
 .worktrees/
 /CLAUDE.md
@@ -27,3 +28,7 @@ demo/*.omni/
 /schema-issues.md
 /schema-prior-art.md
 mdrip/
+crates/omnigraph/benches/results.jsonl
+# CocoIndex Code (ccc)
+/.cocoindex_code/cocoindex.db/
+/.cocoindex_code/target_sqlite.db*

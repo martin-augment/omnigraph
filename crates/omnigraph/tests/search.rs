@@ -3,7 +3,6 @@ mod helpers;
 use std::env;
 
 use arrow_array::{Array, StringArray};
-use lance::index::DatasetIndexExt;
 use lance_index::is_system_index;
 use serial_test::serial;
 
@@ -86,6 +85,7 @@ async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     load_jsonl(&mut db, SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
+    db.ensure_indices().await.unwrap();
     db
 }
 
@@ -95,6 +95,7 @@ async fn init_mock_embedding_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     load_jsonl(&mut db, &mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
+    db.ensure_indices().await.unwrap();
     db
 }
 
@@ -104,6 +105,7 @@ async fn init_model_recorded_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     load_jsonl(&mut db, &mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
+    db.ensure_indices().await.unwrap();
     db
 }
 
@@ -200,6 +202,40 @@ async fn doc_user_index_count(db: &Omnigraph) -> usize {
         .iter()
         .filter(|idx| !is_system_index(idx))
         .count()
+}
+
+/// RFC-022 data writes publish only their exact table effects. Declared FTS
+/// and vector indexes may therefore still be pending immediately after load;
+/// both retrieval modes (and their RRF composition) must remain logically
+/// correct through Lance's flat-search paths.
+#[tokio::test]
+#[serial]
+async fn deferred_indexes_do_not_block_hybrid_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, MOCK_SEARCH_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        &mock_embedding_seed_data(),
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        doc_user_index_count(&db).await,
+        0,
+        "load must leave declared physical indexes to the reconciler"
+    );
+    let result = query_main(
+        &mut db,
+        MOCK_SEARCH_QUERIES,
+        "hybrid_search_vector",
+        &vector_and_string_params("$vq", &mock_embedding("alpha", 4), "$tq", "alpha"),
+    )
+    .await
+    .expect("pending FTS/vector indexes must degrade to flat search");
+    assert_eq!(result_slugs(&result)[0], "alpha-doc");
 }
 
 struct EnvGuard {
@@ -386,6 +422,75 @@ async fn phrase_search_is_documented_fts_fallback() {
 }
 
 // ─── Vector search (nearest) ────────────────────────────────────────────────
+
+/// iss-nearest-postfilter-starves-results: a scalar `match` predicate combined
+/// with `nearest` must return the top-k of the MATCHING rows. Lance's default
+/// is post-filtering (filter applied AFTER the ANN top-k), under which this
+/// fixture — where every filter-matching doc sits far from the query vector,
+/// so the global top-k is entirely non-matching — returns 0 rows despite 3
+/// matches existing. The engine must set prefilter(true) whenever a filter
+/// rides the same scanner as a search.
+#[tokio::test]
+#[serial]
+async fn filtered_nearest_returns_matching_rows_not_postfiltered_topk() {
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    status: String
+    embedding: Vector(4)
+}
+"#;
+    // Query vector is +e1. The three status="miss" docs cluster around +e1
+    // (global top-3); the three status="hit" docs cluster around -e1.
+    const DATA: &str = r#"{"type":"Doc","data":{"slug":"miss-1","status":"miss","embedding":[1.0,0.01,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"miss-2","status":"miss","embedding":[1.0,0.0,0.02,0.0]}}
+{"type":"Doc","data":{"slug":"miss-3","status":"miss","embedding":[1.0,0.0,0.0,0.03]}}
+{"type":"Doc","data":{"slug":"hit-1","status":"hit","embedding":[-1.0,0.01,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"hit-2","status":"hit","embedding":[-1.0,0.0,0.02,0.0]}}
+{"type":"Doc","data":{"slug":"hit-3","status":"hit","embedding":[-1.0,0.0,0.0,0.03]}}
+"#;
+    const QUERIES: &str = r#"
+query filtered_nearest($q: Vector(4)) {
+    match { $d: Doc { status: "hit" } }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    load_jsonl(&mut db, DATA, LoadMode::Overwrite).await.unwrap();
+
+    let result = query_main(
+        &mut db,
+        QUERIES,
+        "filtered_nearest",
+        &vector_param("$q", &[1.0, 0.0, 0.0, 0.0]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.num_rows(),
+        3,
+        "filtered nearest must return the top-k of MATCHING rows (3 hits exist), \
+         not the post-filtered remainder of the global top-k"
+    );
+    let batch = result.concat_batches().unwrap();
+    let slugs = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for i in 0..slugs.len() {
+        assert!(
+            slugs.value(i).starts_with("hit-"),
+            "only matching docs may appear, got {}",
+            slugs.value(i)
+        );
+    }
+}
 
 #[tokio::test]
 #[serial]
@@ -753,6 +858,10 @@ async fn match_text_matches_exact_set_excludes_unrelated() {
 
 // RRF fuses arms OTHER than the default nearest+bm25: two FTS arms (title+body).
 // Proves primary_var resolves when neither arm is `nearest`, and fusion runs.
+// Lance beta.19 #7621 completed the ICU English stop-word list, changing BM25
+// document-length normalization in the body arm. Under the beta.21 pin the
+// title arm ranks rl/ml/dl, the body arm ranks dl/rl/ml, and RRF therefore
+// deterministically ranks rl/dl/ml.
 #[tokio::test]
 #[serial]
 async fn rrf_fuses_two_fts_fields() {
@@ -761,7 +870,7 @@ async fn rrf_fuses_two_fts_fields() {
     let r = query_main(&mut db, SEARCH_QUERIES, "rrf_two_fts", &params(&[("$q", "learning")]))
         .await
         .unwrap();
-    assert_eq!(result_slugs(&r), vec!["dl-basics", "ml-intro", "rl-intro"]);
+    assert_eq!(result_slugs(&r), vec!["rl-intro", "dl-basics", "ml-intro"]);
 }
 
 // RRF fuses two vector arms (no embedding creds — explicit vectors). A doc near
@@ -784,7 +893,7 @@ async fn rrf_fuses_two_vector_queries() {
 
 #[tokio::test]
 #[serial]
-async fn mutation_commit_refreshes_search_indices_without_manual_ensure() {
+async fn mutation_with_deferred_index_coverage_remains_searchable() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
     assert_eq!(doc_user_index_count(&db).await, 4);
@@ -810,7 +919,7 @@ async fn mutation_commit_refreshes_search_indices_without_manual_ensure() {
     assert_eq!(
         doc_user_index_count(&db).await,
         4,
-        "mutation commit should refresh required indices without duplicating them"
+        "mutation must leave physical index materialization to the reconciler"
     );
 
     let result = query_main(
@@ -823,7 +932,7 @@ async fn mutation_commit_refreshes_search_indices_without_manual_ensure() {
     .unwrap();
     assert!(
         result_slugs(&result).contains(&"quasar-notes".to_string()),
-        "newly inserted row should be searchable without an explicit ensure_indices step"
+        "a row outside current index coverage must remain searchable via fallback scan"
     );
 }
 
@@ -850,7 +959,7 @@ async fn rrf_fuses_vector_and_text() {
 
 #[tokio::test]
 #[serial]
-async fn load_commit_creates_vector_index_for_vector_annotations() {
+async fn index_reconciler_creates_vector_index_for_vector_annotations() {
     let schema = r#"
 node Doc {
     slug: String @key
@@ -866,6 +975,12 @@ node Doc {
     load_jsonl(&mut db, data, LoadMode::Overwrite)
         .await
         .unwrap();
+    assert_eq!(
+        doc_user_index_count(&db).await,
+        0,
+        "load publishes exact data effects and leaves physical indexes pending"
+    );
+    db.ensure_indices().await.unwrap();
 
     let ds = snapshot_main(&db)
         .await

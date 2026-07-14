@@ -70,6 +70,24 @@ impl EmbeddingConfig {
     /// 5. provider api-key env (`OPENROUTER_API_KEY`/`OPENAI_API_KEY`, or `GEMINI_API_KEY`).
     pub fn from_env() -> Result<Self> {
         if env_flag("OMNIGRAPH_EMBEDDINGS_MOCK") {
+            // The mock flag deliberately wins (pinned by
+            // from_env_mock_flag_wins) — but overriding an EXPLICITLY
+            // configured real provider must be loud: mock vectors are
+            // indistinguishable from real ones (correct dimension, unit
+            // norm), so a leaked test env var would otherwise silently
+            // poison persisted embeds and query-time nearest().
+            if let Some(provider) = env_string("OMNIGRAPH_EMBED_PROVIDER")
+                && provider != "mock"
+            {
+                tracing::warn!(
+                    target: "omnigraph::embedding",
+                    overridden_provider = %provider,
+                    "OMNIGRAPH_EMBEDDINGS_MOCK is set and overrides the \
+                     explicitly configured OMNIGRAPH_EMBED_PROVIDER — all \
+                     embeddings in this process are deterministic mock \
+                     vectors, not real ones"
+                );
+            }
             return Ok(Self::mock());
         }
 
@@ -542,7 +560,33 @@ fn validate_and_normalize_embedding(
             values.len()
         ));
     }
-    Ok(normalize_vector(values))
+    // Reject poisoned vectors BEFORE normalizing: a NaN component makes the
+    // norm NaN (whose `> EPSILON` comparison is false, silently skipping
+    // normalization), an Inf component normalizes the rest to 0s and itself
+    // to NaN, and a zero vector has no direction — all three would persist
+    // as "successful" embeddings and degrade ANN/IVF for unrelated rows.
+    if let Some(idx) = values.iter().position(|v| !v.is_finite()) {
+        return Err(format!(
+            "embedding component {} is not finite ({})",
+            idx, values[idx]
+        ));
+    }
+    let norm = values
+        .iter()
+        .map(|v| (*v as f64) * (*v as f64))
+        .sum::<f64>()
+        .sqrt() as f32;
+    if norm <= f32::EPSILON {
+        return Err("embedding has zero norm (no direction)".to_string());
+    }
+    // Normalize in place with the norm just computed — `normalize_vector`
+    // would recompute it (and its zero guard is unreachable here, since a
+    // zero norm already returned Err above).
+    let mut values = values;
+    for value in &mut values {
+        *value /= norm;
+    }
+    Ok(values)
 }
 
 fn normalize_vector(mut values: Vec<f32>) -> Vec<f32> {
@@ -778,6 +822,24 @@ mod tests {
         assert!(request["input"].is_array());
         assert_eq!(request["dimensions"], 4);
         assert!(request.get("taskType").is_none());
+    }
+
+    #[test]
+    fn validate_and_normalize_embedding_rejects_non_finite_and_zero() {
+        // iss-embedding-nan-validation: a NaN component must be rejected —
+        // not silently returned un-normalized (NaN > EPSILON is false, so the
+        // normalize guard inverts and the raw NaN vector came back Ok).
+        let err = validate_and_normalize_embedding(vec![f32::NAN, 1.0], 2).unwrap_err();
+        assert!(err.contains("finite"), "NaN must be rejected, got: {err}");
+        // An Inf component must be rejected — not normalized into 0s + NaN.
+        let err = validate_and_normalize_embedding(vec![f32::INFINITY, 1.0], 2).unwrap_err();
+        assert!(err.contains("finite"), "Inf must be rejected, got: {err}");
+        let err =
+            validate_and_normalize_embedding(vec![1.0, f32::NEG_INFINITY], 2).unwrap_err();
+        assert!(err.contains("finite"), "-Inf must be rejected, got: {err}");
+        // An all-zero vector has no direction — undefined under cosine/ANN.
+        let err = validate_and_normalize_embedding(vec![0.0, 0.0], 2).unwrap_err();
+        assert!(err.contains("zero"), "zero vector must be rejected, got: {err}");
     }
 
     #[test]

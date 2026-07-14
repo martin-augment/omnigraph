@@ -40,7 +40,7 @@ storage root, with no local config directory. `--bind`,
 
 ### Stored-query validation at startup
 
-If a graph declares a `queries:` registry (see [cli-reference](../cli/reference.md)), the server **loads and type-checks every stored query against that graph's live schema at startup**. Query parse/type failures quarantine that graph; if no graph remains healthy, startup refuses. Two MCP-exposed queries claiming the same tool name are likewise graph-local startup failures. Non-blocking advisories (e.g. an MCP-exposed query with a vector parameter an agent cannot supply) are logged. Validate offline before deploying with `omnigraph queries validate`. Discover the exposed queries as a typed tool catalog with `GET /queries`, and invoke one over HTTP with `POST /queries/{name}` (both below).
+If a graph declares a `queries:` registry (see [cli-reference](../cli/reference.md)), the server **loads and type-checks every stored query against that graph's live schema at startup**. Query parse/type failures quarantine that graph; if no graph remains healthy, startup refuses. Two MCP-exposed queries claiming the same tool name are likewise graph-local startup failures. Non-blocking advisories (e.g. an MCP-exposed query with a vector parameter an agent cannot supply) are logged. Validate offline before deploying with `omnigraph queries validate`. Discover the stored queries as a typed tool catalog with `GET /queries`, and invoke one over HTTP with `POST /queries/{name}` (both below).
 
 ## Endpoint inventory
 
@@ -57,7 +57,7 @@ graph id from the cluster's applied revision:
 | POST | `/graphs/{id}/export` | bearer + `export` | NDJSON stream |
 | POST | `/graphs/{id}/mutate` | bearer + `change` | mutation (canonical; `query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) |
 | POST | `/graphs/{id}/change` | bearer + `change` | **deprecated** alias of `/mutate` (carries `Deprecation: true` + `Link: <mutate>; rel="successor-version"`) |
-| GET | `/graphs/{id}/queries` | bearer + `read` | list the `mcp.expose` stored queries as a typed tool catalog |
+| GET | `/graphs/{id}/queries` | bearer + `read` | list the graph's stored queries as a typed tool catalog |
 | POST | `/graphs/{id}/queries/{name}` | bearer + `invoke_query` (+ `change` for a stored mutation) | invoke a named query from the `queries:` registry; deny == 404 |
 | GET | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source |
 | POST | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | disabled for cluster-backed serving; returns 409 and points operators at `omnigraph cluster apply` + restart |
@@ -66,7 +66,7 @@ graph id from the cluster's applied revision:
 | GET | `/graphs/{id}/branches` | bearer + `read` | list branches |
 | POST | `/graphs/{id}/branches` | bearer + `branch_create` | create |
 | DELETE | `/graphs/{id}/branches/{branch}` | bearer + `branch_delete` | delete |
-| POST | `/graphs/{id}/branches/merge` | bearer + `branch_merge` | merge `source → target` |
+| POST | `/graphs/{id}/branches/merge` | bearer + `branch_merge` (+ `branch_delete` only when `delete_branch` is set) | merge `source → target`; `delete_branch: true` also deletes the source after the merge lands — a delete refusal is reported via `branch_deleted`/`branch_delete_error` on the 200 response, never as an error |
 | GET | `/graphs/{id}/commits?branch=` | bearer + `read` | list |
 | GET | `/graphs/{id}/commits/{commit_id}` | bearer + `read` | show |
 
@@ -76,12 +76,17 @@ Server-level management endpoints:
 |---|---|---|---|
 | GET | `/graphs` | bearer + `graph_list` on `Server::"root"` | list ready/served graphs |
 
+> The per-graph subsections below name routes in shorthand (`GET /queries`,
+> `POST /query`, `POST /mutate`, `POST /queries/{name}`); every one is served
+> under the `/graphs/{id}/…` prefix shown in the table — only `/graphs` and
+> `/healthz` are flat.
+
 ### Stored-query catalog (`GET /queries`)
 
-List the graph's **`mcp.expose`** stored queries as a typed tool catalog — enough for a client (e.g. an MCP server) to register each as a tool without fetching `.gq` source. Each entry: `{ name, tool_name, description, instruction, mutation, params }`, where each param is `{ name, kind, item_kind?, vector_dim?, nullable }`. `kind` is one of `string | bool | int | bigint | float | date | datetime | blob | vector | list` (decomposed so a consumer maps it with a closed `switch`, never re-parsing GQ type spelling). `bigint` (I64/U64), `date`, `datetime`, and `blob` are carried as JSON **strings** — a 64-bit integer loses precision as a JSON number, dates are ISO strings, and a blob is a URI string.
+List the graph's stored queries as a typed tool catalog — enough for a client (e.g. an MCP server) to register each as a tool without fetching `.gq` source. Each entry: `{ name, tool_name, description, instruction, mutation, params }`, where each param is `{ name, kind, item_kind?, vector_dim?, nullable }`. `kind` is one of `string | bool | int | bigint | float | date | datetime | blob | vector | list` (decomposed so a consumer maps it with a closed `switch`, never re-parsing GQ type spelling). `bigint` (I64/U64), `date`, `datetime`, and `blob` are carried as JSON **strings** — a 64-bit integer loses precision as a JSON number, dates are ISO strings, and a blob is a URI string.
 
 - **Read-gated** (works in default-deny mode). The catalog is **graph-wide** (branch-independent; `read` is authorized against `main`).
-- **`mcp.expose` defaults to `true`** — declaring a query in `queries:` lists it; set `mcp: { expose: false }` to keep it HTTP/service-callable but hidden from the catalog.
+- **Every stored query in the applied registry is listed.** Cluster-served graphs have no per-query expose flag today — every query in the cluster `queries:` registry appears in the catalog. (Per-query exposure may become a Cedar-policy decision in a later release; see [cluster-config](../clusters/config.md).)
 - **Not Cedar-filtered per query (yet).** A caller with `read` but not `invoke_query` can *list* a query they can't *invoke* (which would 404). Closing that gap is future per-query authorization; for now the catalog is a discovery surface and `invoke_query` remains the invocation gate.
 
 ### Stored-query invocation (`POST /queries/{name}`)
@@ -157,25 +162,51 @@ Only `/export` streams (`application/x-ndjson`, MPSC channel + `Body::from_strea
 
 ## Error model
 
-Uniform `ErrorOutput { error, code?, merge_conflicts[], manifest_conflict? }` with `code ∈ unauthorized | forbidden | bad_request | not_found | conflict | too_many_requests | internal`. Merge conflicts attach structured `MergeConflictOutput { table_key, row_id?, kind, message }`.
+Uniform
+`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, read_set_conflict?, recovery_required? }`
+with
+`code ∈ unauthorized | forbidden | bad_request | not_found | method_not_allowed | conflict | too_many_requests | internal`.
+Merge conflicts attach structured
+`MergeConflictOutput { table_key, row_id?, kind, message }`.
 
-`manifest_conflict` is set on **concurrent-write rejections** (HTTP 409): the
-caller's pre-write view of one table's manifest version was stale.
-`ManifestConflictOutput { table_key, expected, actual }` tells the client
-which table to refresh and retry. This is the conflict shape produced by
-concurrent `/mutate` (or its `/change` alias) or `/ingest` calls landing
-the same `(table, branch)` race.
+`manifest_conflict` is set on legacy per-table manifest-version rejections
+(HTTP 409). `ManifestConflictOutput { table_key, expected, actual }` tells the
+client which table was stale. Mutation and load use the unified coarse-OCC
+adapter described next; other writers retain this older conflict shape until
+they are enrolled.
 
-HTTP status codes used: 200, 400, 401, 403, 404, 409, 429, 500.
+`read_set_conflict` is set when a prepared write is rejected before any table
+effect because its branch authority changed. The HTTP status is 409 and
+`ReadSetConflictOutput { member, expected, actual }` identifies the stale
+authority member. The engine already performs a bounded full-attempt retry for
+mutation inserts and load `append`/`merge`. Strict mutation updates/deletes and
+load `overwrite` return the 409 to the caller instead of being replayed.
+
+`recovery_required` is set when an overlapping durable recovery intent remains
+unresolved; its table effects may or may not have started. The HTTP status is 503 and
+`RecoveryRequiredOutput { operation_id }` names the durable recovery intent.
+The optional `code` field is omitted for this response: adding a new value to
+the closed error-code enum would break older clients, while the optional
+structured field is additive and rolling-safe.
+Do not blindly resubmit the write: let a read-write open or the recovery sweep
+resolve that operation first, then retry from a fresh snapshot.
+
+HTTP status codes used: 200, 400, 401, 403, 404, 405, 409, 429, 500, 503.
 
 ## Per-actor admission control
 
-Disjoint
-`(table, branch)` writes from different actors now run concurrently,
-guarded only by the engine's per-(table, branch) write queue. To keep
-one heavy actor from exhausting shared capacity (Lance I/O, manifest
-churn, network), the server gates mutating handlers through per-process
-admission limits configured from environment variables:
+RFC-022-enrolled mutation/load preparation runs outside the effect gates, so
+parsing, validation, and reclaimable fragment staging can overlap across branches.
+Readers acquire none of these gates. Before the first durable effect, however, an
+attempt acquires the exclusive root schema gate, then its branch-effect gate and
+sorted table queues, and holds all of them through manifest publication. The root
+schema gate means enrolled effect windows on one graph currently serialize
+in-process even across different branches; the branch gate preserves one atomic
+graph-head validation authority, while table queues protect each concrete Lance
+effect and legacy writer. These are process-local ordering gates, not a
+cross-process lock. To keep one heavy actor from exhausting shared capacity
+(Lance I/O, manifest churn, network), the server gates mutating handlers through
+per-process admission limits configured from environment variables:
 
 | Env var | Default | Purpose |
 |---|---|---|
@@ -191,7 +222,8 @@ Cedar policy authorization runs **before** admission accounting so
 denied requests don't consume admission slots.
 
 Today admission gates every mutating handler: `/mutate` (and its
-deprecated alias `/change`), `/ingest`, `/branches/{create,delete,merge}`,
+deprecated alias `/change`), `/load` (and its deprecated alias `/ingest`),
+`/branches/{create,delete,merge}`,
 and `/schema/apply`. Read-only endpoints (`/snapshot`, `/query`, `/read`,
 `/export`, `/branches` GET, `/commits`, `/schema` GET) are not
 admission-gated.
@@ -199,7 +231,7 @@ admission-gated.
 ## Body limits
 
 - Default: 1 MB
-- `/ingest`: 32 MB
+- `/load` (and its deprecated `/ingest` alias): 32 MB
 
 ## Auth model (`bearer + SHA-256`)
 
@@ -227,7 +259,7 @@ See [deployment.md](../deployment.md) for token-source operational details.
 
 - CORS — not configured; add `tower_http::cors` if needed.
 - Rate limiting — per-actor admission control gates `/mutate` (alias
-  `/change`), `/ingest`, `/branches/{create,delete,merge}`,
+  `/change`), `/load` (alias `/ingest`), `/branches/{create,delete,merge}`,
   `/schema/apply` (see "Per-actor
   admission control" above). No global rate limiter is configured;
   add `tower_http::limit` if a graph-wide cap is needed.

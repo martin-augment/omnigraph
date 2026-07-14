@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
@@ -187,14 +187,6 @@ impl Omnigraph {
             &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
             actor_id,
         )?;
-        self.ensure_schema_state_valid().await?;
-        // Converge any pending recovery sidecar (a previously failed
-        // writer's Phase B → Phase C residual) before staging anything:
-        // without this, sidecar-covered drift wedges every load on the
-        // commit-time drift guard until a process restart — `repair`
-        // refuses while a sidecar is pending. One `list_dir` when no
-        // sidecars exist (the steady state).
-        self.heal_pending_recovery_sidecars().await?;
         // Reject internal `__run__*` / system-prefixed branches at the
         // public write boundary. Direct-publish paths assert this
         // explicitly so a caller can't write to legacy or system
@@ -212,6 +204,23 @@ impl Omnigraph {
             }
             None => None,
         };
+        // Schema/catalog authority is captured once via the `WriteTxn` (plus its
+        // cheap trailing identity-marker fence); the only second full validation
+        // is the required pre-effect recheck under gates. Per-table resolution
+        // performs no additional contract reads.
+        //
+        // Stage A precedes both an implicit target-branch fork and data staging.
+        // The target branch and an explicit base are read/write authority for the
+        // operation, so an unresolved intent on either closes the barrier. The
+        // helper folds `Some("main")` to main's canonical `None` identity.
+        let mut recovery_branches = vec![requested.as_deref()];
+        if base.is_some() {
+            // `base_branch` retains `Some("main")` for the result DTO; the
+            // barrier helper canonicalizes it to main's `None` identity.
+            recovery_branches.push(base_branch.as_deref());
+        }
+        self.heal_pending_recovery_sidecars_for_write(&recovery_branches)
+            .await?;
         // Fork-if-missing only when a base branch was explicitly given.
         // `requested == None` is `main`, which always exists.
         let mut branch_created = false;
@@ -235,7 +244,7 @@ impl Omnigraph {
         }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
         // branch. Cross-table OCC is enforced by the publisher's
-        // `expected_table_versions` CAS inside `load_jsonl_reader`.
+        // `expected_table_versions` CAS inside the load attempt.
         let mut result = self
             .load_direct_on_branch(requested.as_deref(), data, mode, actor_id)
             .await?;
@@ -271,8 +280,7 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<LoadResult> {
-        let reader = BufReader::new(Cursor::new(data.as_bytes()));
-        load_jsonl_reader(self, branch, reader, mode, actor_id).await
+        load_jsonl_data(self, branch, data, mode, actor_id).await
     }
 }
 
@@ -309,14 +317,55 @@ impl LoadResult {
     }
 }
 
-async fn load_jsonl_reader<R: BufRead>(
+async fn load_jsonl_data(
+    db: &Omnigraph,
+    branch: Option<&str>,
+    data: &str,
+    mode: LoadMode,
+    actor_id: Option<&str>,
+) -> Result<LoadResult> {
+    const MAX_PRE_EFFECT_REPREPARES: usize = 32;
+
+    // Every public load entry point already owns a stable `&str` payload
+    // (`load_file_as` reads its file once). Replay that slice directly on a
+    // pre-effect retry; copying it into a second raw byte buffer would double
+    // peak input memory before the parser's per-type materialization.
+    let retryable = matches!(mode, LoadMode::Append | LoadMode::Merge);
+    for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
+        let replay = BufReader::new(Cursor::new(data.as_bytes()));
+        match load_jsonl_reader_once(db, branch, replay, mode, actor_id).await {
+            Err(err)
+                if retryable
+                    && err.is_read_set_changed()
+                    && attempt < MAX_PRE_EFFECT_REPREPARES =>
+            {
+                tracing::debug!(
+                    attempt = attempt + 1,
+                    branch = branch.unwrap_or("main"),
+                    "prepared load authority changed before effects; repreparing"
+                );
+                db.refresh().await?;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded load retry loop always returns")
+}
+
+async fn load_jsonl_reader_once<R: BufRead>(
     db: &Omnigraph,
     branch: Option<&str>,
     reader: R,
     mode: LoadMode,
     actor_id: Option<&str>,
 ) -> Result<LoadResult> {
-    let catalog = db.catalog().clone();
+    // Capture the manifest/schema authority before interpreting any input. The
+    // catalog rides the WriteTxn and was built from the exact accepted IR named
+    // by its schema token; a long-lived handle's global catalog may legitimately
+    // lag a schema apply completed through another handle.
+    let txn = db.open_write_txn(branch).await?;
+    let catalog = Arc::clone(&txn.catalog);
+    let snapshot = txn.base.clone();
 
     // Phase 1: Parse all lines, spool into per-type collections
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
@@ -397,7 +446,10 @@ async fn load_jsonl_reader<R: BufRead>(
     // inline path.
 
     let mut result = LoadResult::default();
-    let snapshot = db.snapshot_for_branch(branch).await?;
+    // The branch-wide WriteTxn captured above is threaded through every table
+    // open and the manifest publish, so the parsed batches, validation catalog,
+    // base snapshot, native branch identity, exact graph head, and schema
+    // identity form one immutable authority unit.
     let mut staging = MutationStaging::default();
     let pending_mode = match mode {
         LoadMode::Merge => PendingMode::Merge,
@@ -407,54 +459,15 @@ async fn load_jsonl_reader<R: BufRead>(
         LoadMode::Append => PendingMode::Append,
         LoadMode::Overwrite => PendingMode::Overwrite,
     };
-    // Map LoadMode to MutationOpKind for the version-check policy.
-    // Append/Merge skip the strict pre-stage check (concurrency-safe
-    // under the per-(table, branch) queue + publisher CAS); Overwrite
-    // uses the strict check because it truncates and replaces the
-    // dataset — concurrent advances change what "replace" means.
+    // Map LoadMode to the early table-version policy. Append/Merge may stage
+    // reclaimable files before the effect gates, then revalidate the complete
+    // branch token and fully reprepare on a bounded pre-effect conflict.
+    // Overwrite keeps the strict early check because it replaces the image; its
+    // later branch-wide mismatch surfaces `ReadSetChanged` without replay.
     let load_op_kind = match mode {
         LoadMode::Append => crate::db::MutationOpKind::Insert,
         LoadMode::Merge => crate::db::MutationOpKind::Merge,
         LoadMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
-    };
-
-    // Up-front fork-queue acquisition. The first write to a table on a
-    // non-main branch forks it (create_branch), which advances Lance state
-    // before the manifest publish; the reclaim of any manifest-unreferenced
-    // leftover (`reclaim_orphaned_fork_and_refork`) must not race a concurrent
-    // in-process fork. So when this load will fork at least one touched table,
-    // acquire the per-(table, branch) write queues for ALL touched tables up
-    // front (one sorted `acquire_many`, keyed uniformly by the target branch
-    // so it covers what `commit_all` recomputes) and hold them through the
-    // publish. Main-branch loads never fork; branch loads where every touched
-    // table is already forked skip this and let `commit_all` acquire at commit.
-    let fork_queue_guards: Option<(
-        Vec<(String, Option<String>)>,
-        Vec<tokio::sync::OwnedMutexGuard<()>>,
-    )> = if let Some(active) = branch {
-        let touched: Vec<(String, Option<String>)> = node_rows
-            .keys()
-            .map(|t| (format!("node:{t}"), Some(active.to_string())))
-            .chain(
-                edge_rows
-                    .keys()
-                    .map(|e| (format!("edge:{e}"), Some(active.to_string()))),
-            )
-            .collect();
-        let needs_fork = touched.iter().any(|(table_key, _)| {
-            snapshot
-                .entry(table_key)
-                .map(|e| e.table_branch.as_deref() != Some(active))
-                .unwrap_or(false)
-        });
-        if needs_fork {
-            let guards = db.write_queue().acquire_many(&touched).await;
-            Some((touched, guards))
-        } else {
-            None
-        }
-    } else {
-        None
     };
 
     // Phase 2a: build and validate every node batch up front. Cheap and
@@ -464,12 +477,7 @@ async fn load_jsonl_reader<R: BufRead>(
     for (type_name, rows) in &node_rows {
         let node_type = &catalog.node_types[type_name];
         let batch = build_node_batch(node_type, rows)?;
-        validate_value_constraints(&batch, node_type)?;
-        validate_enum_constraints(&batch, &node_type.properties, type_name)?;
-        let unique_groups = unique_constraint_groups_for_node(node_type);
-        if !unique_groups.is_empty() {
-            enforce_unique_constraints_intra_batch(&batch, type_name, &unique_groups)?;
-        }
+        // Validation (value/enum/unique) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("node:{}", type_name);
         let _entry = snapshot
@@ -481,15 +489,19 @@ async fn load_jsonl_reader<R: BufRead>(
     // Phase 2b: accumulate every node type in memory. Fragment writes are
     // delayed until after all validation succeeds.
     for (type_name, table_key, batch, loaded_count) in prepared_nodes {
-        let (ds, full_path, table_branch) = db
-            .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
+        // The loader only needs the captured expected version (the publisher's
+        // CAS fence) for `ensure_path` — it discards the handle. With a
+        // non-strict load op (Merge/Append) and a `WriteTxn`, collapse #1 skips
+        // the dataset open and returns the pinned base version directly.
+        let opened = db
+            .open_for_mutation_on_branch(branch, &table_key, load_op_kind, Some(&txn))
             .await?;
-        let expected_version = ds.version();
         staging.ensure_path(
             &table_key,
-            full_path,
-            table_branch,
-            expected_version,
+            opened.full_path,
+            opened.table_branch,
+            opened.deferred_fork,
+            opened.expected_version,
             load_op_kind,
         );
         let schema = batch.schema();
@@ -497,52 +509,14 @@ async fn load_jsonl_reader<R: BufRead>(
         result.nodes_loaded.insert(type_name, loaded_count);
     }
 
-    // Phase 2c: Validate edge referential integrity — every src/dst must
-    // reference an existing node ID in the appropriate type. For
-    // Append/Merge the lookup unions snapshot-committed IDs with the
-    // in-memory pending batches. For Overwrite, a touched node table's
-    // pending batch is the replacement image, so committed rows are not
-    // included for that table.
-    for (edge_name, rows) in &edge_rows {
-        let edge_type = &catalog.edge_types[edge_name];
-        let from_ids =
-            collect_node_ids_with_pending(db, branch, &edge_type.from_type, &staging).await?;
-        let to_ids =
-            collect_node_ids_with_pending(db, branch, &edge_type.to_type, &staging).await?;
-
-        for (i, (src, dst, _)) in rows.iter().enumerate() {
-            if !from_ids.contains(src.as_str()) {
-                return Err(OmniError::manifest(format!(
-                    "edge {} row {}: src '{}' not found in {}",
-                    edge_name,
-                    i + 1,
-                    src,
-                    edge_type.from_type
-                )));
-            }
-            if !to_ids.contains(dst.as_str()) {
-                return Err(OmniError::manifest(format!(
-                    "edge {} row {}: dst '{}' not found in {}",
-                    edge_name,
-                    i + 1,
-                    dst,
-                    edge_type.to_type
-                )));
-            }
-        }
-    }
-
-    // Phase 2d: build edge batches.
+    // Phase 2d: build edge batches. Edge referential integrity (and the rest)
+    // runs end-of-load via the unified evaluator, below.
     let mut prepared_edges: Vec<(String, String, RecordBatch, usize)> =
         Vec::with_capacity(edge_rows.len());
     for (edge_name, rows) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
         let batch = build_edge_batch(edge_type, rows)?;
-        validate_enum_constraints(&batch, &edge_type.properties, edge_name)?;
-        let unique_groups = unique_constraint_groups_for_edge(edge_type);
-        if !unique_groups.is_empty() {
-            enforce_unique_constraints_intra_batch(&batch, edge_name, &unique_groups)?;
-        }
+        // Validation (enum/unique, edge-RI, @card) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("edge:{}", edge_name);
         let _entry = snapshot
@@ -553,15 +527,17 @@ async fn load_jsonl_reader<R: BufRead>(
 
     // Phase 2e: accumulate every edge type. Same dispatch as Phase 2b.
     for (edge_name, table_key, batch, loaded_count) in prepared_edges {
-        let (ds, full_path, table_branch) = db
-            .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
+        // Same as the node phase: only the captured expected version is used;
+        // collapse #1 skips the open for a non-strict load op under a `WriteTxn`.
+        let opened = db
+            .open_for_mutation_on_branch(branch, &table_key, load_op_kind, Some(&txn))
             .await?;
-        let expected_version = ds.version();
         staging.ensure_path(
             &table_key,
-            full_path,
-            table_branch,
-            expected_version,
+            opened.full_path,
+            opened.table_branch,
+            opened.deferred_fork,
+            opened.expected_version,
             load_op_kind,
         );
         let schema = batch.schema();
@@ -569,46 +545,99 @@ async fn load_jsonl_reader<R: BufRead>(
         result.edges_loaded.insert(edge_name, loaded_count);
     }
 
-    // Phase 3: Validate edge cardinality constraints (before commit —
-    // invalid data must not be committed). The helper scans committed
-    // edges via Lance + iterates pending edges in-memory; for Overwrite it
-    // treats the pending edge batches as the replacement table image.
-    for (edge_name, _) in &edge_rows {
-        let edge_type = &catalog.edge_types[edge_name];
-        let table_key = format!("edge:{}", edge_name);
-        validate_edge_cardinality_with_pending_loader(
-            db, branch, edge_type, &table_key, &staging, mode,
-        )
-        .await?;
+    // Phase 3: end-of-load validation — one unified evaluator pass over the
+    // accumulated staging (value/enum, uniqueness incl. cross-version, edge-RI,
+    // cardinality) against the pinned pre-load base. `Overwrite` validates each
+    // touched table as its whole new image (that table's committed view empty),
+    // but is PER-TABLE — a table absent from the batch keeps `base`, so an
+    // edges-only overwrite still resolves RI against committed nodes;
+    // `Append`/`Merge` keep `base` everywhere. This shares the evaluator with the
+    // mutation + merge paths, so the surfaces cannot drift.
+    let mut changeset = staging.to_changeset();
+    // Overwrite replaces each touched table; a committed row absent from the new
+    // batch is REMOVED but is not in `to_changeset` (which only records the new
+    // batch). Express those removals as `deleted_ids` so edge-RI (path-b) and
+    // cardinality recompute against them — e.g. overwriting `node:Person` to drop
+    // Bob while a retained `edge:Knows(Alice->Bob)` would otherwise publish an
+    // orphan. (Per-table, like the rest of Overwrite handling.)
+    if mode == LoadMode::Overwrite {
+        let keys: Vec<String> = changeset.keys().cloned().collect();
+        for table_key in keys {
+            let removed = crate::validate::overwrite_removed_ids(
+                &snapshot,
+                &table_key,
+                changeset.get(&table_key).expect("key from this changeset"),
+            )
+            .await?;
+            if !removed.is_empty() {
+                changeset
+                    .get_mut(&table_key)
+                    .expect("key from this changeset")
+                    .deleted_ids = removed;
+            }
+        }
     }
+    let committed = crate::validate::CommittedState::load(&snapshot, mode, &changeset);
+    crate::validate::validate_changeset(&changeset, &committed, &catalog).await?;
 
     // Phase 4: Atomic manifest commit with publisher-level OCC.
     let staged = staging
         .stage_all_with_concurrency(db, branch, load_write_concurrency())
         .await?;
-    // `_queue_guards` holds per-(table_key, branch) write queues
-    // across the manifest publish below — see exec/mutation.rs for
-    // the rationale (interleaving prevention).
-    let (updates, expected_versions, sidecar_handle, _queue_guards) = staged
+    crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+    let lineage_intent = db.new_lineage_intent_for_branch(branch, actor_id).await?;
+    // `_queue_guards` holds the root-shared schema → branch → sorted-table
+    // gates across manifest publication. This closes same-process
+    // interleaving across the v3 sidecar/effect lifetime. The exact publisher
+    // token and durable sidecar remain persistent correctness authorities, but
+    // these local gates do not expand the documented single-writer-process
+    // recovery boundary.
+    let crate::exec::staging::CommittedMutation {
+        updates,
+        expected_versions,
+        sidecar_handle,
+        guards: _queue_guards,
+    } = staged
         .commit_all(
             db,
             branch,
             crate::db::manifest::SidecarKind::Load,
             actor_id,
-            fork_queue_guards,
+            &txn,
+            &lineage_intent,
         )
         .await?;
-    // Same finalize → publisher residual as mutations: per-table
-    // staged commits have advanced Lance HEAD, but the manifest
-    // publish has not run yet. Reuse the mutation failpoint name so
-    // one failpoint pins the shared `MutationStaging` boundary.
-    crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
-    db.commit_updates_on_branch_with_expected(branch, &updates, &expected_versions, actor_id)
-        .await?;
-    // The recovery sidecar protects the per-table commit_staged →
-    // manifest publish window. Phase C succeeded — clean up
-    // best-effort: failing the user here would error out a write
-    // that already landed durably.
+    // Same confirmed-effects → publisher boundary as mutations: table HEADs
+    // have advanced and the v3 sidecar contains their exact transaction
+    // identities, but the graph manifest has not published the result. Reuse
+    // the mutation failpoint name so one failpoint pins the shared boundary.
+    crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+    let publish_result = db
+        .commit_updates_on_branch_with_expected(
+            branch,
+            &updates,
+            &expected_versions,
+            actor_id,
+            &txn,
+            lineage_intent,
+        )
+        .await;
+    if let Err(err) = publish_result {
+        // Empty loads can still publish lineage but have no table effect and
+        // therefore no recovery sidecar. Preserve that publish error instead
+        // of manufacturing an "unknown" recovery operation.
+        return match sidecar_handle.as_ref() {
+            Some(handle) => Err(OmniError::recovery_required(
+                handle.operation_id.clone(),
+                err.to_string(),
+            )),
+            None => Err(err),
+        };
+    }
+    // The v3 recovery sidecar protects every independently durable table effect
+    // through the one manifest visibility point. Phase C succeeded — clean up
+    // best-effort: failing the user here would error out a write that already
+    // landed durably; a leftover fixed outcome is idempotently finalized later.
     if let Some(handle) = sidecar_handle {
         if let Err(err) = crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await {
             tracing::warn!(
@@ -898,9 +927,18 @@ fn build_column_from_json(
                         )));
                     }
                     for val in arr {
-                        builder
-                            .values()
-                            .append_value(val.as_f64().unwrap_or(0.0) as f32);
+                        // Parity with the mutation path: non-numeric elements
+                        // (null — what json! emits for a non-finite float —
+                        // strings, bools) are rejected loudly, never coerced
+                        // to 0.0, which would silently corrupt the vector's
+                        // direction while passing every dimension check.
+                        let Some(v) = val.as_f64() else {
+                            return Err(OmniError::manifest(format!(
+                                "vector property '{}' elements must be numeric, got {}",
+                                name, val
+                            )));
+                        };
+                        builder.values().append_value(v as f32);
                     }
                     builder.append(true);
                 } else if nullable {
@@ -1331,61 +1369,6 @@ pub(crate) fn validate_enum_constraints(
     Ok(())
 }
 
-/// Detect duplicate values within a single `RecordBatch` for any of the
-/// `unique_constraints` groups. Each group is a list of one or more columns
-/// that together form a uniqueness key: a violation occurs when two rows share
-/// the same tuple of values across *all* columns in a group, so a composite
-/// `@unique(a, b)` only conflicts when both `a` and `b` match. Returns an
-/// error on the first duplicate found.
-///
-/// Rows where any column in a group is null are exempt (standard SQL semantics
-/// for uniqueness over nullable columns), as is any group whose columns are
-/// not all present in the batch (e.g. a partial-schema load).
-///
-/// Note: this only catches duplicates *within* the batch. Cross-batch
-/// uniqueness against already-committed rows is not enforced here — that
-/// requires a dataset scan and is tracked separately.
-pub(crate) fn enforce_unique_constraints_intra_batch(
-    batch: &RecordBatch,
-    type_name: &str,
-    unique_constraints: &[Vec<String>],
-) -> Result<()> {
-    for columns in unique_constraints {
-        // Resolve the group's columns once. A group whose columns aren't all
-        // present in this batch is skipped (e.g. a partial-schema load).
-        let Some(group_columns) = columns
-            .iter()
-            .map(|name| {
-                batch
-                    .schema()
-                    .index_of(name)
-                    .ok()
-                    .map(|i| batch.column(i).clone())
-            })
-            .collect::<Option<Vec<ArrayRef>>>()
-        else {
-            continue;
-        };
-        let mut seen: HashMap<Vec<String>, usize> = HashMap::new();
-        for row in 0..batch.num_rows() {
-            let Some(key) = composite_unique_key(&group_columns, row)? else {
-                continue;
-            };
-            if let Some(prev_row) = seen.insert(key.clone(), row) {
-                return Err(OmniError::manifest(format!(
-                    "@unique violation on {}.{}: value '{}' appears in rows {} and {}",
-                    type_name,
-                    format_tuple(columns),
-                    format_tuple(&key),
-                    prev_row,
-                    row
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Build the composite uniqueness key for `row` over a constraint group's
 /// already-resolved columns (in declaration order).
 ///
@@ -1399,9 +1382,10 @@ pub(crate) fn enforce_unique_constraints_intra_batch(
 /// - `Ok(Some(tuple))` otherwise.
 /// - `Err(..)` propagated from [`unique_key_scalar`] on an un-keyable value.
 ///
-/// Shared by the intake path (`enforce_unique_constraints_intra_batch`) and the
-/// branch-merge path (`exec/merge.rs::update_unique_constraints`) so the two
-/// derive identical keys and cannot drift on separator or scalar conversion.
+/// Shared by every write surface through the unified validation evaluator
+/// (`crate::validate::evaluate_unique`, used by the loader, mutation, and
+/// branch-merge paths) so they derive identical keys and cannot drift on
+/// separator or scalar conversion.
 pub(crate) fn composite_unique_key(
     group_columns: &[ArrayRef],
     row: usize,
@@ -1419,7 +1403,7 @@ pub(crate) fn composite_unique_key(
 /// Render a constraint's column tuple for error messages: a single item as
 /// `col`, a composite as `(a, b)`. Used for both the column list and the
 /// offending value tuple, which share the same shape.
-fn format_tuple(items: &[String]) -> String {
+pub(crate) fn format_tuple(items: &[String]) -> String {
     match items {
         [single] => single.clone(),
         _ => format!("({})", items.join(", ")),
@@ -1487,32 +1471,6 @@ fn unique_key_scalar(array: &ArrayRef, row: usize) -> Result<Option<String>> {
     )))
 }
 
-/// Build the list of uniqueness constraint groups to enforce on a node type.
-/// Each group is the column tuple of one constraint. Includes every
-/// `@unique(...)` constraint (from `NodeType.unique_constraints`) and the
-/// `@key` (which implies uniqueness over its column tuple). Grouping is
-/// preserved so a composite `@unique(a, b)` is enforced as a composite key
-/// rather than degraded into independent single-field checks.
-pub(crate) fn unique_constraint_groups_for_node(
-    node_type: &omnigraph_compiler::catalog::NodeType,
-) -> Vec<Vec<String>> {
-    let mut groups: Vec<Vec<String>> = node_type.unique_constraints.clone();
-    if let Some(key) = &node_type.key
-        && !groups.contains(key)
-    {
-        groups.push(key.clone());
-    }
-    groups
-}
-
-/// Same as [`unique_constraint_groups_for_node`] but for an edge type (edges
-/// have no `@key`).
-pub(crate) fn unique_constraint_groups_for_edge(
-    edge_type: &omnigraph_compiler::catalog::EdgeType,
-) -> Vec<Vec<String>> {
-    edge_type.unique_constraints.clone()
-}
-
 fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
     use arrow_array::{
         Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array,
@@ -1544,196 +1502,6 @@ fn literal_value_to_f64(v: &omnigraph_compiler::catalog::LiteralValue) -> f64 {
         LiteralValue::Integer(n) => *n as f64,
         LiteralValue::Float(f) => *f,
     }
-}
-
-// ─── Edge cardinality validation ─────────────────────────────────────────────
-
-pub(crate) async fn validate_edge_cardinality(
-    db: &crate::db::Omnigraph,
-    branch: Option<&str>,
-    edge_name: &str,
-    written_version: u64,
-    written_branch: Option<&str>,
-) -> Result<()> {
-    use arrow_array::Array;
-    let catalog = db.catalog();
-    let edge_type = &catalog.edge_types[edge_name];
-    if edge_type.cardinality.is_default() {
-        return Ok(());
-    }
-
-    // Open edge sub-table at the just-written version, not the snapshot's
-    // (the snapshot still pins to the pre-write version).
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let table_key = format!("edge:{}", edge_name);
-    let entry = snapshot
-        .entry(&table_key)
-        .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-    let ds = db
-        .open_dataset_at_state(
-            &entry.table_path,
-            written_branch.or(entry.table_branch.as_deref()),
-            written_version,
-        )
-        .await?;
-
-    // Scan src column, count per source
-    let batches = db.storage().scan(&ds, Some(&["src"]), None, None).await?;
-
-    let mut counts: HashMap<String, u32> = HashMap::new();
-    for batch in &batches {
-        let srcs = batch
-            .column_by_name("src")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        for i in 0..srcs.len() {
-            *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
-        }
-    }
-
-    let card = &edge_type.cardinality;
-    for (src, count) in &counts {
-        if let Some(max) = card.max {
-            if *count > max {
-                return Err(OmniError::manifest(format!(
-                    "@card violation on edge {}: source '{}' has {} edges (max {})",
-                    edge_name, src, count, max
-                )));
-            }
-        }
-        if *count < card.min {
-            return Err(OmniError::manifest(format!(
-                "@card violation on edge {}: source '{}' has {} edges (min {})",
-                edge_name, src, count, card.min
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-/// Validate edge `@card` cardinality with in-memory pending edges visible.
-///
-/// Loader-level analog to `exec::mutation::validate_edge_cardinality_with_pending`:
-/// opens the committed dataset at the pre-load snapshot version, then
-/// delegates to the shared `count_src_per_edge` + `enforce_cardinality_bounds`
-/// helpers in `exec::staging`. Used by Append/Merge loads (the Overwrite
-/// path uses `validate_edge_cardinality` which opens the just-written
-/// Lance version).
-///
-/// `mode` controls dedup behavior. `LoadMode::Merge` passes `Some("id")`
-/// so committed edges that the load is *updating* (same edge id,
-/// possibly changed `src`) are not double-counted. `LoadMode::Append`
-/// passes `None` because each line generates a fresh ULID id that
-/// never collides with committed.
-async fn validate_edge_cardinality_with_pending_loader(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    edge_type: &omnigraph_compiler::catalog::EdgeType,
-    table_key: &str,
-    staging: &MutationStaging,
-    mode: LoadMode,
-) -> Result<()> {
-    if edge_type.cardinality.is_default() {
-        return Ok(());
-    }
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let Some(entry) = snapshot.entry(table_key) else {
-        // No manifest entry — table doesn't exist yet. Pending-only is
-        // fine; the helper handles empty committed scans.
-        return Ok(());
-    };
-    let ds = db
-        .open_dataset_at_state(
-            &entry.table_path,
-            entry.table_branch.as_deref(),
-            entry.table_version,
-        )
-        .await?;
-    let dedupe_key = match mode {
-        LoadMode::Merge => Some("id"),
-        LoadMode::Append | LoadMode::Overwrite => None,
-    };
-    let counts =
-        crate::exec::staging::count_src_per_edge(db, &ds, table_key, staging, dedupe_key).await?;
-    crate::exec::staging::enforce_cardinality_bounds(edge_type, &counts)
-}
-
-/// Collect all valid node IDs for a given type, with in-memory pending
-/// node inserts visible. Used by the staged loader's Phase 2c
-/// referential-integrity validation.
-///
-/// Union of:
-/// - IDs from the staged loader's pending batches (in-memory; just-staged
-///   inserts of this type)
-/// - IDs from the committed sub-table at the pre-load snapshot version
-///
-/// For `LoadMode::Overwrite`, if the node table is touched then the pending
-/// batches are the replacement image. In that case committed IDs are not
-/// included, so edge RI is validated against exactly what the overwrite will
-/// publish.
-async fn collect_node_ids_with_pending(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    type_name: &str,
-    staging: &MutationStaging,
-) -> Result<HashSet<String>> {
-    let mut ids = HashSet::new();
-    let table_key = format!("node:{}", type_name);
-
-    // From staging.pending: walk the in-memory accumulator's id column.
-    for batch in staging.pending_batches(&table_key) {
-        if let Some(col) = batch.column_by_name("id") {
-            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                for i in 0..arr.len() {
-                    if arr.is_valid(i) {
-                        ids.insert(arr.value(i).to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    if staging.pending_mode(&table_key) == Some(PendingMode::Overwrite) {
-        return Ok(ids);
-    }
-
-    // From the committed Lance sub-table at the pre-load snapshot version.
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let Some(entry) = snapshot.entry(&table_key) else {
-        return Ok(ids);
-    };
-    let ds = db
-        .open_dataset_at_state(
-            &entry.table_path,
-            entry.table_branch.as_deref(),
-            entry.table_version,
-        )
-        .await?;
-
-    let batches = db.storage().scan(&ds, Some(&["id"]), None, None).await?;
-
-    for batch in &batches {
-        let id_col = batch
-            .column_by_name("id")
-            .ok_or_else(|| OmniError::Lance("missing 'id' column".into()))?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| OmniError::Lance("'id' column is not Utf8".into()))?;
-        for i in 0..batch.num_rows() {
-            // Defensive: `id` is the @key column on every node type and
-            // is non-nullable by schema, but a committed-row corruption
-            // (or future schema change) could surface a NULL. Skip
-            // rather than insert "" — pending-side does the same.
-            if id_col.is_valid(i) {
-                ids.insert(id_col.value(i).to_string());
-            }
-        }
-    }
-
-    Ok(ids)
 }
 
 #[cfg(test)]
@@ -2095,7 +1863,10 @@ edge WorksAt: Person -> Company
         let result = db
             .load_as("nonexistent", None, TEST_DATA, LoadMode::Merge, None)
             .await;
-        assert!(result.is_err(), "load without base must not create branches");
+        assert!(
+            result.is_err(),
+            "load without base must not create branches"
+        );
         assert!(
             !db.branch_list()
                 .await
@@ -2105,7 +1876,10 @@ edge WorksAt: Person -> Company
         );
 
         // Loads to main carry the default branch metadata.
-        let main_load = db.load("main", TEST_DATA, LoadMode::Overwrite).await.unwrap();
+        let main_load = db
+            .load("main", TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
         assert_eq!(main_load.branch, "main");
         assert_eq!(main_load.base_branch, None);
         assert!(!main_load.branch_created);

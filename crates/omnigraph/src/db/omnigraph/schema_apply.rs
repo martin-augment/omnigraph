@@ -34,6 +34,15 @@ fn promote_drops_to_hard(plan: &mut SchemaMigrationPlan, allow_data_loss: bool) 
     }
 }
 
+fn pre_minted_schema_transaction(
+    read_version: u64,
+) -> crate::table_store::StagedTransactionIdentity {
+    crate::table_store::StagedTransactionIdentity {
+        read_version,
+        uuid: format!("omnigraph-schema-{}", ulid::Ulid::new()),
+    }
+}
+
 pub(super) async fn plan_schema(
     db: &Omnigraph,
     desired_schema_source: &str,
@@ -60,6 +69,16 @@ async fn plan_schema_for_apply(
     options: SchemaApplyOptions,
 ) -> Result<PlannedSchemaApply> {
     db.ensure_schema_state_valid().await?;
+    let accepted_ir = read_accepted_schema_ir(db.uri(), Arc::clone(&db.storage)).await?;
+    plan_schema_for_apply_from_accepted(db, desired_schema_source, options, &accepted_ir).await
+}
+
+async fn plan_schema_for_apply_from_accepted(
+    db: &Omnigraph,
+    desired_schema_source: &str,
+    options: SchemaApplyOptions,
+    accepted_ir: &SchemaIR,
+) -> Result<PlannedSchemaApply> {
     let branches = db.coordinator.read().await.all_branches().await?;
     // Skip `main` and internal system branches (the schema-apply lock branch,
     // the cluster-wide schema-apply serializer). Legacy `__run__*` staging
@@ -77,9 +96,8 @@ async fn plan_schema_for_apply(
         )));
     }
 
-    let accepted_ir = read_accepted_schema_ir(db.uri(), Arc::clone(&db.storage)).await?;
     let desired_ir = read_schema_ir_from_source(desired_schema_source)?;
-    let mut plan = plan_schema_migration(&accepted_ir, &desired_ir)
+    let mut plan = plan_schema_migration(accepted_ir, &desired_ir)
         .map_err(|err| OmniError::manifest(err.to_string()))?;
     promote_drops_to_hard(&mut plan, options.allow_data_loss);
     if !plan.supported {
@@ -152,8 +170,18 @@ where
     // exists, so the heal can never observe it.
     db.heal_pending_recovery_sidecars().await?;
 
+    // Process-local schema-control gate. RFC-022 mutation/load commit paths
+    // acquire this before their branch/table gates and retain it through
+    // publication. Taking it before the durable sentinel closes the old race in
+    // which schema apply could create the sentinel while a mutation already held
+    // a table queue, causing that mutation to advance Lance HEAD and only then
+    // discover the schema lock. The native sentinel remains the cross-handle /
+    // crash-visible authority; this queue removes the avoidable same-handle race.
+    let schema_gate_key = crate::db::manifest::schema_apply_serial_queue_key();
+    let _schema_gate = db.write_queue().acquire(&schema_gate_key).await;
     acquire_schema_apply_lock(db).await?;
-    let result = apply_schema_with_lock(db, desired_schema_source, options, validate_catalog).await;
+    let result =
+        apply_schema_with_lock(db, desired_schema_source, options, actor, validate_catalog).await;
     let release_result = release_schema_apply_lock(db).await;
     match (result, release_result) {
         (Ok(result), Ok(())) => Ok(result),
@@ -167,12 +195,25 @@ pub(super) async fn apply_schema_with_lock<F>(
     db: &Omnigraph,
     desired_schema_source: &str,
     options: SchemaApplyOptions,
+    actor: Option<&str>,
     validate_catalog: F,
 ) -> Result<SchemaApplyResult>
 where
     F: FnOnce(&Catalog) -> Result<()>,
 {
-    let planned = plan_schema_for_apply(db, desired_schema_source, options).await?;
+    // Capture the accepted contract, compiled catalog, manifest snapshot, and
+    // main authority as one operation-local view while the schema gate and
+    // durable SchemaApply sentinel are held. A long-lived handle's ArcSwap
+    // catalog may lag another handle, so it is never an authority here.
+    db.refresh_coordinator_only().await?;
+    let (accepted_ir, accepted_schema_state) =
+        load_validated_schema_contract(db.uri(), Arc::clone(&db.storage)).await?;
+    let mut accepted_catalog = build_catalog_from_ir(&accepted_ir)?;
+    fixup_blob_schemas(&mut accepted_catalog);
+    let accepted_catalog = Arc::new(accepted_catalog);
+    let planned =
+        plan_schema_for_apply_from_accepted(db, desired_schema_source, options, &accepted_ir)
+            .await?;
     validate_catalog(&planned.desired_catalog)?;
     let PlannedSchemaApply {
         plan,
@@ -188,10 +229,17 @@ where
         });
     }
 
-    let snapshot = db.snapshot().await;
-    let base_manifest_version = snapshot.version();
+    let (snapshot, base_branch_identifier, base_graph_head, lineage_intent) = {
+        let coordinator = db.coordinator.read().await;
+        (
+            coordinator.snapshot(),
+            coordinator.branch_identifier().await?,
+            coordinator.exact_graph_head(),
+            coordinator.new_lineage_intent(actor, None)?,
+        )
+    };
     let mut added_tables = BTreeSet::new();
-    let mut renamed_tables = HashMap::new();
+    let mut renamed_tables = BTreeMap::new();
     let mut rewritten_tables = BTreeSet::new();
     let mut dropped_tables = BTreeSet::new();
     // Hard-drop cleanup targets: (table_key, full_dataset_uri).
@@ -257,7 +305,12 @@ where
             // critical path by ensure_indices/optimize (iss-848), so the apply
             // does no table work for it — a pure metadata change like the two
             // metadata steps below.
+            // ExtendEnum is a pure widening (planner-verified superset): every
+            // committed row is valid under the wider set, so no table data is
+            // touched — the accepted catalog update alone makes the unified
+            // validator accept the new variants on all three write surfaces.
             SchemaMigrationStep::AddConstraint { .. }
+            | SchemaMigrationStep::ExtendEnum { .. }
             | SchemaMigrationStep::UpdateTypeMetadata { .. }
             | SchemaMigrationStep::UpdatePropertyMetadata { .. } => {}
             SchemaMigrationStep::DropProperty {
@@ -342,33 +395,85 @@ where
         }
     }
 
-    let mut table_registrations = HashMap::<String, String>::new();
-    let mut table_updates = HashMap::<String, crate::db::SubTableUpdate>::new();
-    let mut table_tombstones = HashMap::<String, u64>::new();
+    let mut table_registrations = BTreeMap::<String, String>::new();
+    let mut table_updates = BTreeMap::<String, crate::db::SubTableUpdate>::new();
+    let mut table_tombstones = BTreeMap::<String, u64>::new();
 
-    // Recovery sidecar: protect the per-table `stage_overwrite` +
-    // `commit_staged` in rewritten_tables — the only tables that advance Lance
-    // HEAD inline now that index building is deferred to the reconciler
-    // (iss-848). Each rewritten table is exactly one commit, so
-    // `post_commit_pin = expected + 1` is now exact (it was a loose lower bound
-    // when index builds added extra commits); the classifier's loose-match for
-    // SidecarKind::SchemaApply still accepts it.
-    let recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = rewritten_tables
-        .iter()
-        .filter_map(|table_key| {
-            let entry = snapshot.entry(table_key)?;
-            Some(crate::db::manifest::SidecarTablePin {
-                table_key: table_key.clone(),
-                table_path: db.storage().dataset_uri(&entry.table_path),
-                expected_version: entry.table_version,
-                post_commit_pin: entry.table_version + 1,
-                // SchemaApply uses the loose match, not BranchMerge's Phase-B
-                // confirmation — left None.
-                confirmed_version: None,
-                table_branch: entry.table_branch.clone(),
-            })
-        })
-        .collect();
+    // Pre-mint every table transaction before recovery is armed. Existing
+    // rewrites are exact Overwrite transactions at their manifest pins;
+    // AddType/RenameType targets are strict first-version Overwrites at
+    // read_version=0. Metadata/tombstone-only applies deliberately have no
+    // table effects but still arm v7 because schema staging is durable state.
+    let mut recovery_pins = Vec::new();
+    let mut recovery_effects = Vec::new();
+    let mut recovery_slots = Vec::new();
+    let mut planned_transactions = HashMap::new();
+    for table_key in added_tables.iter().chain(renamed_tables.keys()) {
+        let table_path = table_path_for_table_key(table_key)?;
+        let planned = pre_minted_schema_transaction(0);
+        recovery_pins.push(crate::db::manifest::SidecarTablePin {
+            table_key: table_key.clone(),
+            table_path: db.storage().dataset_uri(&table_path),
+            expected_version: 0,
+            post_commit_pin: 1,
+            confirmed_version: None,
+            table_branch: None,
+        });
+        planned_transactions.insert(table_key.clone(), planned.clone());
+        recovery_effects.push(crate::db::manifest::RecoverySchemaApplyEffect {
+            table_key: table_key.clone(),
+            kind: crate::db::manifest::RecoverySchemaApplyEffectKind::FirstTouchDataset {
+                planned_transaction: planned,
+                confirmed_transaction: None,
+            },
+        });
+        recovery_slots.push(crate::db::manifest::RecoveryTableUpdateSlot {
+            table_key: table_key.clone(),
+            expected_version: 0,
+            table_branch: None,
+            confirmed: None,
+        });
+    }
+    for table_key in &rewritten_tables {
+        if added_tables.contains(table_key) || renamed_tables.contains_key(table_key) {
+            continue;
+        }
+        let entry = snapshot.entry(table_key).ok_or_else(|| {
+            OmniError::manifest(format!(
+                "missing source table '{}' for schema apply recovery plan",
+                table_key
+            ))
+        })?;
+        if entry.table_branch.is_some() {
+            return Err(OmniError::manifest_internal(format!(
+                "schema apply expected main-owned table '{}', found branch {:?}",
+                table_key, entry.table_branch
+            )));
+        }
+        let planned = pre_minted_schema_transaction(entry.table_version);
+        recovery_pins.push(crate::db::manifest::SidecarTablePin {
+            table_key: table_key.clone(),
+            table_path: db.storage().dataset_uri(&entry.table_path),
+            expected_version: entry.table_version,
+            post_commit_pin: entry.table_version + 1,
+            confirmed_version: None,
+            table_branch: None,
+        });
+        planned_transactions.insert(table_key.clone(), planned.clone());
+        recovery_effects.push(crate::db::manifest::RecoverySchemaApplyEffect {
+            table_key: table_key.clone(),
+            kind: crate::db::manifest::RecoverySchemaApplyEffectKind::ExistingOverwrite {
+                planned_transaction: planned,
+                confirmed_transaction: None,
+            },
+        });
+        recovery_slots.push(crate::db::manifest::RecoveryTableUpdateSlot {
+            table_key: table_key.clone(),
+            expected_version: entry.table_version,
+            table_branch: None,
+            confirmed: None,
+        });
+    }
     // Capture additional registrations + tombstones for the sidecar so
     // recovery can publish them alongside the per-table updates. Without
     // this, an added type's dataset is created in Phase B but the
@@ -424,276 +529,489 @@ where
         table_tombstones.insert(dropped_table_key.clone(), tombstone_version);
     }
 
-    // Acquire per-(table_key, branch) queues for every existing table
-    // that schema_apply will rewrite or re-index. New tables (added or
-    // renamed targets) aren't acquired — they have no existing dataset
-    // to race against. Held across the per-table commit loop and the
-    // manifest publish via `commit_changes_with_actor` below.
-    //
-    // Schema-apply already holds the graph-wide `__schema_apply_lock__`
-    // sentinel branch, so these per-table acquisitions are uncontended in
-    // practice. They exist for symmetry with the recovery reconciler, which
-    // acquires the same queues before any `Dataset::restore` it issues for
-    // SchemaApply sidecars.
-    let mut schema_apply_queue_keys: Vec<(String, Option<String>)> = recovery_pins
-        .iter()
-        .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
+    // Complete effect envelope: the outer `apply_schema` already holds the
+    // graph-wide schema gate, so add main's branch gate and every live table
+    // gate in the shared schema -> branch -> sorted-table order. Schema apply
+    // is graph-global (including metadata-only changes and hard drops), so a
+    // rewrite-only subset is not a sufficient envelope.
+    let schema_apply_queue_keys: Vec<(String, Option<String>)> = snapshot
+        .entries()
+        .map(|entry| (entry.table_key.clone(), entry.table_branch.clone()))
         .collect();
-    // The serialization key the write-entry heal acquires before touching
-    // schema staging or a SchemaApply sidecar. Per-table keys alone don't
-    // cover a registration-only migration (no pins, but a sidecar and
-    // staging files on disk) — without this, a concurrent write's heal can
-    // promote this apply's staging files and publish its registrations out
-    // from under it. Acquired whenever a sidecar will be written, held
-    // through Phase D (the guards live to the end of this function).
-    let writes_sidecar = !(recovery_pins.is_empty()
-        && sidecar_registrations.is_empty()
-        && sidecar_tombstones.is_empty());
-    if writes_sidecar {
-        schema_apply_queue_keys.push(crate::db::manifest::schema_apply_serial_queue_key());
-    }
+    // The outer `apply_schema` holds the schema-control serialization key from
+    // before sentinel creation through sentinel release. Per-table guards here
+    // therefore cover only the concrete table effects; acquiring the schema key
+    // again would deadlock because these queues are intentionally non-reentrant.
+    let _main_branch_guard = db.write_queue().acquire_branch(None).await;
     let _schema_apply_queue_guards = db
         .write_queue()
         .acquire_many(&schema_apply_queue_keys)
         .await;
 
-    let recovery_handle = if !writes_sidecar {
-        None
-    } else {
-        // `branch=None` because schema_apply publishes against main —
-        // the `__schema_apply_lock__` branch is purely a serialization
-        // sentinel (acquire_schema_apply_lock creates it; the manifest
-        // publish via coordinator.commit_changes_with_actor below targets
-        // the coordinator's active branch, which is the pre-lock branch).
-        // If the lock release fires before recovery, the lock branch is
-        // gone — the sidecar must not reference it.
-        let mut sidecar = crate::db::manifest::new_sidecar(
-            crate::db::manifest::SidecarKind::SchemaApply,
-            None,
-            // `apply_schema` doesn't currently take an actor (no `apply_schema_as`
-            // public API). The HTTP server's /schema/apply handler can pass actor
-            // context through a follow-up addition. For now, system-attributed.
-            None,
-            recovery_pins,
-        );
-        sidecar.additional_registrations = sidecar_registrations;
-        sidecar.tombstones = sidecar_tombstones;
-        Some(
-            crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar)
-                .await?,
+    // The entry heal ran before planning, but another writer can arm recovery
+    // while this apply waits for its effect gates. List again under the complete
+    // envelope before this writer claims any physical state.
+    db.ensure_no_pending_recovery_sidecars_under_gates(&[None], "schema_apply")
+        .await?;
+
+    // The snapshot was captured before the branch/table waits. Revalidate the
+    // complete authority token now, while those gates are held, so a stale
+    // plan never writes a sidecar. Physical-only __manifest compaction may
+    // change its numeric version without changing this logical authority.
+    db.refresh_coordinator_only().await?;
+    let (current_branch_identifier, current_graph_head) = {
+        let coordinator = db.coordinator.read().await;
+        (
+            coordinator.branch_identifier().await?,
+            coordinator.exact_graph_head(),
         )
     };
+    if current_branch_identifier != base_branch_identifier {
+        return Err(OmniError::manifest_read_set_changed(
+            "branch_identifier:main",
+            Some(
+                serde_json::to_string(&base_branch_identifier).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "serialize captured main branch identifier: {error}"
+                    ))
+                })?,
+            ),
+            Some(
+                serde_json::to_string(&current_branch_identifier).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "serialize current main branch identifier: {error}"
+                    ))
+                })?,
+            ),
+        ));
+    }
+    if current_graph_head != base_graph_head {
+        return Err(OmniError::manifest_read_set_changed(
+            "graph_head:main",
+            base_graph_head.clone(),
+            current_graph_head,
+        ));
+    }
+    let current_schema_state = read_schema_state_identity(db.uri(), db.storage.as_ref()).await?;
+    if current_schema_state != accepted_schema_state {
+        return Err(OmniError::manifest_read_set_changed(
+            "schema_identity",
+            Some(format!(
+                "{}:{}",
+                accepted_schema_state.schema_identity_version, accepted_schema_state.schema_ir_hash
+            )),
+            Some(format!(
+                "{}:{}",
+                current_schema_state.schema_identity_version, current_schema_state.schema_ir_hash
+            )),
+        ));
+    }
 
-    for table_key in &added_tables {
+    // Prove every existing physical ref is still exactly at its manifest pin
+    // before arming the exact SchemaApply sidecar. Retain the verified handles
+    // and reuse them below: reopening after this ownership check would create a
+    // needless second HEAD observation and blur the pre-arm boundary.
+    let mut existing_heads = HashMap::<String, SnapshotHandle>::new();
+    for entry in snapshot.entries() {
+        let dataset_uri = db.storage().dataset_uri(&entry.table_path);
+        let head = db
+            .storage()
+            .open_dataset_head(&dataset_uri, entry.table_branch.as_deref())
+            .await?;
+        db.ensure_existing_effect_baseline(
+            &entry.table_key,
+            entry.table_branch.as_deref(),
+            entry.table_version,
+            &head,
+        )
+        .await?;
+        existing_heads.insert(entry.table_key.clone(), head);
+    }
+
+    // Added types and rename targets have no manifest authority yet. A physical
+    // dataset already present at one of those paths is therefore an orphan or a
+    // foreign effect, never state this apply may retroactively claim through
+    // `additional_registrations` recovery.
+    let target_table_keys = added_tables
+        .iter()
+        .chain(renamed_tables.keys())
+        .collect::<BTreeSet<_>>();
+    for table_key in target_table_keys {
         let table_path = table_path_for_table_key(table_key)?;
         let dataset_uri = db.storage().dataset_uri(&table_path);
-        let schema = schema_for_table_key(&desired_catalog, table_key)?;
-        let ds =
-            SnapshotHandle::new(TableStore::create_empty_dataset(&dataset_uri, &schema).await?);
-        // Indexes for the new table are materialized off the critical path by
-        // ensure_indices/optimize (iss-848); a 0-row table is never trainable
-        // anyway. The @index intent is recorded in the persisted catalog/IR.
-        let state = db.storage().table_state(&dataset_uri, &ds).await?;
-        table_registrations.insert(table_key.clone(), table_path);
-        table_updates.insert(
-            table_key.clone(),
-            crate::db::SubTableUpdate {
-                table_key: table_key.clone(),
-                table_version: state.version,
-                table_branch: None,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            },
-        );
-    }
-
-    for (target_table_key, source_table_key) in &renamed_tables {
-        let source_entry = snapshot.entry(source_table_key).ok_or_else(|| {
-            OmniError::manifest(format!(
-                "missing source table '{}' for schema rename",
-                source_table_key
-            ))
-        })?;
-        ensure_snapshot_entry_head_matches(db, source_entry).await?;
-        let source_ds = db
-            .storage()
-            .open_snapshot_at_table(&snapshot, source_table_key)
-            .await?;
-        let current_catalog = db.catalog();
-        let batch = batch_for_schema_apply_rewrite(
-            db,
-            &source_ds,
-            source_table_key,
-            &current_catalog,
-            target_table_key,
-            &desired_catalog,
-            property_renames.get(target_table_key),
-        )
-        .await?;
-        let table_path = table_path_for_table_key(target_table_key)?;
-        let dataset_uri = db.storage().dataset_uri(&table_path);
-        let target_ds = SnapshotHandle::new(TableStore::write_dataset(&dataset_uri, batch).await?);
-        // Indexes on the renamed table are reconciled later (iss-848).
-        let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
-        table_registrations.insert(target_table_key.clone(), table_path);
-        table_updates.insert(
-            target_table_key.clone(),
-            crate::db::SubTableUpdate {
-                table_key: target_table_key.clone(),
-                table_version: state.version,
-                table_branch: None,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            },
-        );
-        table_tombstones.insert(
-            source_table_key.clone(),
-            source_entry.table_version.saturating_add(1),
-        );
-    }
-
-    for table_key in &rewritten_tables {
-        if added_tables.contains(table_key) || renamed_tables.contains_key(table_key) {
-            continue;
+        if db.storage_adapter().exists(&dataset_uri).await? {
+            return Err(OmniError::manifest_conflict(format!(
+                "schema apply target table '{}' has an existing dataset at '{}' but no live manifest entry; refusing to claim unowned physical state — inspect and remove the orphaned dataset before retrying",
+                table_key, dataset_uri,
+            )));
         }
-        let entry = snapshot.entry(table_key).ok_or_else(|| {
-            OmniError::manifest(format!(
-                "missing source table '{}' for schema apply",
-                table_key
-            ))
-        })?;
-        ensure_snapshot_entry_head_matches(db, entry).await?;
-        let source_ds = db
-            .storage()
-            .open_snapshot_at_table(&snapshot, table_key)
+    }
+
+    // Every non-empty migration writes a sidecar, including table-effect-free
+    // index/enum/metadata changes. Their empty table-pin set is intentional:
+    // schema staging is the durable threshold that lets recovery deterministically
+    // roll back a pre-staging crash or roll forward a post-staging crash.
+    // `branch=None` because schema_apply publishes against main — the
+    // `__schema_apply_lock__` branch is purely a serialization sentinel.
+    let target_schema_ir_hash = omnigraph_compiler::schema_ir_hash(&desired_ir)
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    let recovery_authority = crate::db::manifest::RecoveryAuthorityToken {
+        branch_identifier: base_branch_identifier.clone(),
+        graph_head: base_graph_head.clone(),
+        schema_ir_hash: accepted_schema_state.schema_ir_hash.clone(),
+        schema_identity_version: accepted_schema_state.schema_identity_version,
+    };
+    let recovery_lineage = crate::db::manifest::RecoveryLineageIntent {
+        graph_commit_id: lineage_intent.graph_commit_id.clone(),
+        branch: lineage_intent.branch.clone(),
+        actor_id: lineage_intent.actor_id.clone(),
+        merged_parent_commit_id: lineage_intent.merged_parent_commit_id.clone(),
+        created_at: lineage_intent.created_at,
+    };
+    let mut sidecar = crate::db::manifest::new_schema_apply_sidecar_v7(
+        actor.map(str::to_string),
+        recovery_pins,
+        recovery_authority,
+        recovery_lineage,
+        recovery_effects,
+        crate::db::manifest::RecoveryManifestDelta {
+            table_updates: recovery_slots,
+            registrations: sidecar_registrations,
+            tombstones: sidecar_tombstones,
+        },
+        target_schema_ir_hash,
+    )?;
+    let recovery_handle =
+        crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?;
+    let recovery_operation_id = recovery_handle.operation_id.clone();
+
+    let post_arm_result = async {
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT,
+        )?;
+        let mut committed_transactions = HashMap::new();
+
+        for table_key in &added_tables {
+            let table_path = table_path_for_table_key(table_key)?;
+            let dataset_uri = db.storage().dataset_uri(&table_path);
+            let schema = schema_for_table_key(&desired_catalog, table_key)?;
+            let batch = RecordBatch::new_empty(schema);
+            let mut staged = db.storage().stage_create(&dataset_uri, batch).await?;
+            let planned = planned_transactions.get(table_key).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "missing planned SchemaApply transaction for '{}'",
+                    table_key
+                ))
+            })?;
+            staged.bind_transaction_identity(planned)?;
+            let outcome = db
+                .storage()
+                .commit_staged_create_exact(&dataset_uri, staged)
+                .await?;
+            if !outcome.is_exact() {
+                return Err(OmniError::manifest_internal(format!(
+                    "SchemaApply first-touch '{}' committed outside its exact version-one transaction plan",
+                    table_key
+                )));
+            }
+            committed_transactions.insert(
+                table_key.clone(),
+                outcome.committed_transaction().clone(),
+            );
+            let ds = outcome.into_snapshot();
+            // Indexes for the new table are materialized off the critical path by
+            // ensure_indices/optimize (iss-848); a 0-row table is never trainable
+            // anyway. The @index intent is recorded in the persisted catalog/IR.
+            let state = db.storage().table_state(&dataset_uri, &ds).await?;
+            table_registrations.insert(table_key.clone(), table_path);
+            table_updates.insert(
+                table_key.clone(),
+                crate::db::SubTableUpdate {
+                    table_key: table_key.clone(),
+                    table_version: state.version,
+                    table_branch: None,
+                    row_count: state.row_count,
+                    version_metadata: state.version_metadata,
+                },
+            );
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::SCHEMA_APPLY_POST_TABLE_COMMIT,
+            )?;
+        }
+
+        for (target_table_key, source_table_key) in &renamed_tables {
+            let source_entry = snapshot.entry(source_table_key).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "missing source table '{}' for schema rename",
+                    source_table_key
+                ))
+            })?;
+            let source_ds = existing_heads.get(source_table_key).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "missing preflighted source table '{}' for schema rename",
+                    source_table_key
+                ))
+            })?;
+            let batch = batch_for_schema_apply_rewrite(
+                db,
+                source_ds,
+                source_table_key,
+                accepted_catalog.as_ref(),
+                target_table_key,
+                &desired_catalog,
+                property_renames.get(target_table_key),
+            )
             .await?;
-        let current_catalog = db.catalog();
-        let batch = batch_for_schema_apply_rewrite(
-            db,
-            &source_ds,
-            table_key,
-            &current_catalog,
-            table_key,
-            &desired_catalog,
-            property_renames.get(table_key),
+            let table_path = table_path_for_table_key(target_table_key)?;
+            let dataset_uri = db.storage().dataset_uri(&table_path);
+            let mut staged = db.storage().stage_create(&dataset_uri, batch).await?;
+            let planned = planned_transactions.get(target_table_key).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "missing planned SchemaApply transaction for '{}'",
+                    target_table_key
+                ))
+            })?;
+            staged.bind_transaction_identity(planned)?;
+            let outcome = db
+                .storage()
+                .commit_staged_create_exact(&dataset_uri, staged)
+                .await?;
+            if !outcome.is_exact() {
+                return Err(OmniError::manifest_internal(format!(
+                    "SchemaApply rename target '{}' committed outside its exact version-one transaction plan",
+                    target_table_key
+                )));
+            }
+            committed_transactions.insert(
+                target_table_key.clone(),
+                outcome.committed_transaction().clone(),
+            );
+            let target_ds = outcome.into_snapshot();
+            // Indexes on the renamed table are reconciled later (iss-848).
+            let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
+            table_registrations.insert(target_table_key.clone(), table_path);
+            table_updates.insert(
+                target_table_key.clone(),
+                crate::db::SubTableUpdate {
+                    table_key: target_table_key.clone(),
+                    table_version: state.version,
+                    table_branch: None,
+                    row_count: state.row_count,
+                    version_metadata: state.version_metadata,
+                },
+            );
+            table_tombstones.insert(
+                source_table_key.clone(),
+                source_entry.table_version.saturating_add(1),
+            );
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::SCHEMA_APPLY_POST_TABLE_COMMIT,
+            )?;
+        }
+
+        for table_key in &rewritten_tables {
+            if added_tables.contains(table_key) || renamed_tables.contains_key(table_key) {
+                continue;
+            }
+            let entry = snapshot.entry(table_key).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "missing source table '{}' for schema apply",
+                    table_key
+                ))
+            })?;
+            let source_ds = existing_heads.remove(table_key).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "missing preflighted source table '{}' for schema apply",
+                    table_key
+                ))
+            })?;
+            let batch = batch_for_schema_apply_rewrite(
+                db,
+                &source_ds,
+                table_key,
+                accepted_catalog.as_ref(),
+                table_key,
+                &desired_catalog,
+                property_renames.get(table_key),
+            )
+            .await?;
+            let dataset_uri = db.storage().dataset_uri(&entry.table_path);
+            // Reuse the handle that was opened and pin-checked before arming;
+            // reopening here would introduce a second HEAD observation.
+            let existing = source_ds;
+            let mut staged = db.storage().stage_overwrite(&existing, batch).await?;
+            let planned = planned_transactions.get(table_key).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "missing planned SchemaApply transaction for '{}'",
+                    table_key
+                ))
+            })?;
+            staged.bind_transaction_identity(planned)?;
+            let outcome = db
+                .storage()
+                .commit_staged_exact(existing, staged)
+                .await?;
+            if !outcome.is_exact() {
+                return Err(OmniError::manifest_internal(format!(
+                    "SchemaApply rewrite '{}' committed outside its exact transaction/version plan",
+                    table_key
+                )));
+            }
+            committed_transactions.insert(
+                table_key.clone(),
+                outcome.committed_transaction().clone(),
+            );
+            let target_ds = outcome.into_snapshot();
+            // The rewrite drops the table's existing index coverage; it is
+            // restored off the critical path by optimize's optimize_indices /
+            // ensure_indices (iss-848). Reads scan uncovered fragments meanwhile.
+            let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
+            table_updates.insert(
+                table_key.clone(),
+                crate::db::SubTableUpdate {
+                    table_key: table_key.clone(),
+                    table_version: state.version,
+                    table_branch: None,
+                    row_count: state.row_count,
+                    version_metadata: state.version_metadata,
+                },
+            );
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::SCHEMA_APPLY_POST_TABLE_COMMIT,
+            )?;
+        }
+
+        // Index-only changes (AddConstraint, i.e. adding an `@index`) are pure
+        // metadata: the new `@index` intent is recorded in the desired catalog/IR
+        // persisted below, and the physical index is materialized off the critical
+        // path by `ensure_indices`/`optimize` (iss-848). Schema apply touches no
+        // table data for them, so there is no per-table loop here and no recovery
+        // pin (no Lance HEAD advances). Reads stay correct meanwhile via a scan.
+
+        let mut manifest_changes = Vec::new();
+        let mut expected_versions = HashMap::new();
+        for (table_key, table_path) in table_registrations {
+            expected_versions.insert(table_key.clone(), 0);
+            manifest_changes.push(ManifestChange::RegisterTable(TableRegistration {
+                table_key,
+                table_path,
+            }));
+        }
+        let confirmed_updates = table_updates.into_values().collect::<Vec<_>>();
+        for update in &confirmed_updates {
+            let expected = planned_transactions
+                .get(&update.table_key)
+                .map(|transaction| transaction.read_version)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "missing SchemaApply expected version for '{}'",
+                        update.table_key
+                    ))
+                })?;
+            expected_versions.insert(update.table_key.clone(), expected);
+            manifest_changes.push(ManifestChange::Update(update.clone()));
+        }
+        for (table_key, tombstone_version) in table_tombstones {
+            expected_versions.insert(table_key.clone(), tombstone_version.saturating_sub(1));
+            manifest_changes.push(ManifestChange::Tombstone(TableTombstone {
+                table_key,
+                tombstone_version,
+            }));
+        }
+
+        // Atomic schema apply: schema staging is part of the exact Phase-B
+        // confirmation. Armed always means rollback; EffectsConfirmed is eligible
+        // for the fixed exact-head manifest commit and subsequent promotion.
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::SCHEMA_APPLY_BEFORE_STAGING_WRITE,
+        )?;
+
+        let staging_pg_uri = schema_source_staging_uri(&db.root_uri);
+        db.storage
+            .write_text(&staging_pg_uri, desired_schema_source)
+            .await?;
+        write_schema_contract_staging(&db.root_uri, db.storage.as_ref(), &desired_ir).await?;
+        let target_hash = sidecar
+            .protocol_v7
+            .as_ref()
+            .expect("new SchemaApply sidecar is v7")
+            .target_schema_ir_hash
+            .clone();
+        crate::db::schema_state::validate_exact_schema_staging_target(
+            db.root_uri(),
+            db.storage_adapter(),
+            &target_hash,
         )
         .await?;
-        let dataset_uri = db.storage().dataset_uri(&entry.table_path);
-        // Pass `entry.table_branch.as_deref()` (not `None`) for
-        // consistency with the indexed_tables block below. Schema
-        // apply runs under `__schema_apply_lock__` which today rejects
-        // non-main branches, so `entry.table_branch` is expected to be
-        // `None`. But the defensive passthrough means a future relaxation
-        // of the lock-check can't quietly open the wrong HEAD here.
-        let existing = db
-            .storage()
-            .open_dataset_head_for_write(table_key, &dataset_uri, entry.table_branch.as_deref())
-            .await?;
-        let staged = db.storage().stage_overwrite(&existing, batch).await?;
-        let target_ds = db.storage().commit_staged(existing, staged).await?;
-        // The rewrite drops the table's existing index coverage; it is
-        // restored off the critical path by optimize's optimize_indices /
-        // ensure_indices (iss-848). Reads scan uncovered fragments meanwhile.
-        let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
-        table_updates.insert(
-            table_key.clone(),
-            crate::db::SubTableUpdate {
-                table_key: table_key.clone(),
-                table_version: state.version,
-                table_branch: None,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            },
+
+        crate::db::manifest::confirm_schema_apply_sidecar_v7(
+            db.root_uri(),
+            db.storage_adapter(),
+            &mut sidecar,
+            &confirmed_updates,
+            &committed_transactions,
+        )
+        .await?;
+        // Preserve the existing failpoint contract: "after staging" is the
+        // recoverable roll-forward seam immediately before manifest publication.
+        // In v7 the exact physical identities and complete manifest delta must be
+        // durably confirmed before that seam is exposed.
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::SCHEMA_APPLY_AFTER_STAGING_WRITE,
+        )?;
+
+        let precondition = crate::db::manifest::PublishPrecondition::ExactGraphHead(
+            crate::db::manifest::GraphHeadExpectation::new(
+                None,
+                base_branch_identifier.clone(),
+                base_graph_head.clone(),
+            ),
         );
-    }
+        let PublishedSnapshot {
+            manifest_version,
+            _snapshot_id: _,
+        } = db
+            .coordinator
+            .write()
+            .await
+            .commit_changes_with_intent_and_expected(
+                &manifest_changes,
+                &expected_versions,
+                lineage_intent,
+                &precondition,
+            )
+            .await?;
 
-    // Index-only changes (AddConstraint, i.e. adding an `@index`) are pure
-    // metadata: the new `@index` intent is recorded in the desired catalog/IR
-    // persisted below, and the physical index is materialized off the critical
-    // path by `ensure_indices`/`optimize` (iss-848). Schema apply touches no
-    // table data for them, so there is no per-table loop here and no recovery
-    // pin (no Lance HEAD advances). Reads stay correct meanwhile via a scan.
-
-    let mut manifest_changes = Vec::new();
-    for (table_key, table_path) in table_registrations {
-        manifest_changes.push(ManifestChange::RegisterTable(TableRegistration {
-            table_key,
-            table_path,
-        }));
-    }
-    for update in table_updates.into_values() {
-        manifest_changes.push(ManifestChange::Update(update));
-    }
-    for (table_key, tombstone_version) in table_tombstones {
-        manifest_changes.push(ManifestChange::Tombstone(TableTombstone {
-            table_key,
-            tombstone_version,
-        }));
-    }
-
-    db.refresh_coordinator_only().await?;
-    let current_manifest_version = db.version().await;
-    if current_manifest_version != base_manifest_version {
-        return Err(OmniError::manifest_conflict(format!(
-            "schema apply lost its write lease: main advanced from v{} to v{} while schema apply was in progress",
-            base_manifest_version, current_manifest_version,
-        )));
-    }
-
-    // Atomic schema apply.
-    //
-    // Write the new schema source + IR contract to staging filenames first,
-    // then commit the manifest, then rename staging → final. A crash
-    // between these stages is recoverable on next open via
-    // `recover_schema_state_files`:
-    //   - crash before commit  → manifest unchanged; staging deleted on open
-    //   - crash after commit   → manifest advanced; staging renamed on open
-    crate::failpoints::maybe_fail("schema_apply.before_staging_write")?;
-
-    let staging_pg_uri = schema_source_staging_uri(&db.root_uri);
-    db.storage
-        .write_text(&staging_pg_uri, desired_schema_source)
-        .await?;
-    write_schema_contract_staging(&db.root_uri, db.storage.as_ref(), &desired_ir).await?;
-
-    crate::failpoints::maybe_fail("schema_apply.after_staging_write")?;
-
-    // `apply_schema` doesn't currently take an actor; system-attributed.
-    let PublishedSnapshot {
-        manifest_version,
-        _snapshot_id: _,
-    } = db
-        .coordinator
-        .write()
-        .await
-        .commit_changes_with_actor(&manifest_changes, None)
-        .await?;
-
-    crate::failpoints::maybe_fail("schema_apply.after_manifest_commit")?;
-
-    db.storage
-        .rename_text(&staging_pg_uri, &schema_source_uri(&db.root_uri))
-        .await?;
-    db.storage
-        .rename_text(
-            &schema_ir_staging_uri(&db.root_uri),
-            &schema_ir_uri(&db.root_uri),
-        )
-        .await?;
-    db.storage
-        .rename_text(
-            &schema_state_staging_uri(&db.root_uri),
-            &schema_state_uri(&db.root_uri),
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT,
+        )?;
+        crate::db::schema_state::promote_exact_schema_staging(
+            db.root_uri(),
+            db.storage_adapter(),
+            &target_hash,
         )
         .await?;
 
-    db.store_catalog(desired_catalog);
-    db.store_schema_source(desired_schema_source.to_string());
-    db.coordinator.write().await.refresh().await?;
-    db.runtime_cache.invalidate_all().await;
-    if changed_edge_tables {
-        db.invalidate_graph_index().await;
+        db.store_catalog(desired_catalog);
+        db.store_schema_source(desired_schema_source.to_string());
+        db.coordinator.write().await.refresh().await?;
+        db.runtime_cache.invalidate_all().await;
+        if changed_edge_tables {
+            db.invalidate_graph_index().await;
+        }
+        Ok::<u64, OmniError>(manifest_version)
     }
+    .await;
+
+    let manifest_version = match post_arm_result {
+        Ok(manifest_version) => manifest_version,
+        Err(error) => {
+            return Err(OmniError::recovery_required(
+                recovery_operation_id,
+                error.to_string(),
+            ));
+        }
+    };
 
     // Recovery sidecar lifecycle: delete after the manifest commit
     // succeeded. Best-effort: if this delete fails, the sidecar persists
@@ -702,14 +1020,14 @@ where
     // artifact (recovery is a no-op and the sidecar is cleaned up).
     // Failing the schema_apply call would report failure for a migration
     // that already succeeded.
-    if let Some(handle) = recovery_handle {
-        if let Err(err) = crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await {
-            tracing::warn!(
-                error = %err,
-                operation_id = handle.operation_id.as_str(),
-                "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
-            );
-        }
+    if let Err(err) =
+        crate::db::manifest::delete_sidecar(&recovery_handle, db.storage_adapter()).await
+    {
+        tracing::warn!(
+            error = %err,
+            operation_id = recovery_handle.operation_id.as_str(),
+            "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
+        );
     }
 
     // Hard-drop cleanup: run cleanup_old_versions on each dataset
@@ -751,10 +1069,13 @@ where
 async fn cleanup_dataset_old_versions(db: &Omnigraph, full_uri: &str) -> Result<()> {
     use chrono::Utc;
     use lance::dataset::cleanup::CleanupPolicy;
-    // forbidden-api-allow: maintenance (Hard-drop version GC) opens the dataset to run cleanup_old_versions.
-    let ds = lance::Dataset::open(full_uri)
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let ds = crate::instrumentation::open_dataset(
+        full_uri,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
     let policy = CleanupPolicy {
         before_timestamp: Some(Utc::now()),
         before_version: None,
@@ -845,23 +1166,6 @@ pub(super) async fn ensure_schema_apply_not_locked(db: &Omnigraph, operation: &s
         )));
     }
     Ok(())
-}
-
-pub(super) async fn ensure_snapshot_entry_head_matches(
-    db: &Omnigraph,
-    entry: &SubTableEntry,
-) -> Result<()> {
-    let dataset_uri = db.storage().dataset_uri(&entry.table_path);
-    let ds = db
-        .storage()
-        .open_dataset_head_for_write(
-            &entry.table_key,
-            &dataset_uri,
-            entry.table_branch.as_deref(),
-        )
-        .await?;
-    db.storage()
-        .ensure_expected_version(&ds, &entry.table_key, entry.table_version)
 }
 
 pub(super) async fn batch_for_schema_apply_rewrite(

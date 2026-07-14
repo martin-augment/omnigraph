@@ -22,6 +22,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
     Json(HealthOutput {
         status: "ok".to_string(),
         version: SERVER_VERSION.to_string(),
+        internal_schema_version: SERVER_INTERNAL_SCHEMA_VERSION,
         source_version: SERVER_SOURCE_VERSION.map(str::to_string),
     })
 }
@@ -459,13 +460,23 @@ pub(crate) async fn server_snapshot(
             target_branch: None,
         },
     )?;
-    let snapshot = {
+    let (snapshot, internal_schema_version) = {
         let db = &handle.engine;
-        db.snapshot_of(ReadTarget::branch(branch.as_str()))
+        let snapshot = db
+            .snapshot_of(ReadTarget::branch(branch.as_str()))
             .await
-            .map_err(ApiError::from_omni)?
+            .map_err(ApiError::from_omni)?;
+        let internal_schema_version = db
+            .internal_schema_version_of(ReadTarget::branch(branch.as_str()))
+            .await
+            .map_err(ApiError::from_omni)?;
+        (snapshot, internal_schema_version)
     };
-    Ok(Json(snapshot_payload(&branch, &snapshot)))
+    Ok(Json(snapshot_payload(
+        &branch,
+        &snapshot,
+        internal_schema_version,
+    )))
 }
 
 /// Header values that flag a response as coming from a deprecated route
@@ -777,8 +788,9 @@ pub(crate) async fn run_query(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -826,8 +838,9 @@ pub(crate) async fn server_change(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -836,7 +849,8 @@ pub(crate) async fn server_change(
 /// Writes to the named `branch` (defaults to `main`). Mutations are atomic
 /// per call and produce a new commit. Returns counts of nodes and edges
 /// affected. **Destructive**: on success the branch is updated; rejected
-/// mutations may still acquire locks briefly. Returns 409 on merge conflict.
+/// mutations may still acquire locks briefly. Returns 409 when the prepared
+/// write authority changes before effects.
 ///
 /// Pairs with `POST /query` (read-only). The legacy `POST /change` route
 /// has identical semantics and is kept as a deprecated alias.
@@ -893,9 +907,10 @@ pub(crate) fn parse_optional_invoke_body(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden (the inner `change` gate for a stored mutation)", body = ErrorOutput),
         (status = 404, description = "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant", body = ErrorOutput),
-        (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 409, description = "Stored mutation write-authority conflict", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 500, description = "Policy evaluation error (a denial is reported as 404, not 500)", body = ErrorOutput),
+        (status = 503, description = "A stored mutation is blocked by a durable recovery intent", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1026,7 +1041,7 @@ pub(crate) async fn server_invoke_query(
     tag = "queries",
     operation_id = "list_queries",
     responses(
-        (status = 200, description = "Stored-query catalog (the mcp.expose subset, with typed params)", body = QueriesCatalogOutput),
+        (status = 200, description = "Stored-query catalog (every stored query, with typed params)", body = QueriesCatalogOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
     ),
@@ -1034,10 +1049,11 @@ pub(crate) async fn server_invoke_query(
 )]
 /// List the graph's exposed stored queries as a typed tool catalog.
 ///
-/// Returns the `mcp.expose == true` subset of the `queries:` registry, each
+/// Returns every stored query in the `queries:` registry, each
 /// with its MCP tool name, read/mutate flag, description/instruction, and
 /// typed parameters — enough for a client to register them as tools without
-/// fetching `.gq` source. Read-gated; the catalog is graph-wide (branch
+/// fetching `.gq` source. Cluster-served graphs have no per-query expose flag,
+/// so the catalog lists them all. Read-gated; the catalog is graph-wide (branch
 /// independent — `read` is authorized against `main`). **Not** Cedar-filtered
 /// per query yet, so it can list a query whose `invoke_query` the caller
 /// lacks (a known gap until per-query authorization lands).
@@ -1191,25 +1207,11 @@ pub(crate) async fn server_schema_apply(
         .await
         .map_err(ApiError::from_omni)?
     };
-    // Prompt index convergence (iss-848): schema apply records `@index` intent
-    // but defers the physical build. On a long-lived server, materialize it
-    // promptly rather than waiting for the next `optimize` cron — spawned
-    // detached so it never blocks or fails the apply response. Best-effort: a
-    // failure is logged and the index still converges on the next optimize.
-    // The CLI is one-shot, so it has no equivalent; its convergence path is the
-    // operator's optimize cadence.
-    if result.applied {
-        let engine = Arc::clone(&handle.engine);
-        tokio::spawn(async move {
-            if let Err(err) = engine.ensure_indices().await {
-                tracing::warn!(
-                    target: "omnigraph::server",
-                    error = %err,
-                    "post-apply ensure_indices failed; indexes will converge on the next optimize",
-                );
-            }
-        });
-    }
+    // Physical indexes are derived state. Schema apply records intent only;
+    // explicit `ensure_indices` / `optimize` maintenance owns convergence on
+    // every surface, including a long-lived server. Keeping the handler free
+    // of detached physical writes also makes a successful response describe
+    // the complete effect envelope of this request.
     Ok(Json(schema_apply_output(handle.uri.as_str(), result)))
 }
 
@@ -1301,7 +1303,9 @@ async fn run_ingest(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1345,7 +1349,9 @@ pub(crate) async fn server_load(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1425,6 +1431,7 @@ pub(crate) async fn server_branch_list(
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Branch already exists", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1506,6 +1513,7 @@ pub(crate) struct BranchPath {
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 404, description = "Branch not found", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1567,6 +1575,7 @@ pub(crate) async fn server_branch_delete(
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Merge conflict", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1576,6 +1585,11 @@ pub(crate) async fn server_branch_delete(
 /// `already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the
 /// list of conflicts if the merge cannot be completed; the target is left
 /// unchanged in that case. **Destructive** to `target` on success.
+///
+/// With `delete_branch: true` the source branch is deleted after a successful
+/// merge, under its own `branch_delete` policy check. The merge is durable by
+/// then, so a deletion refusal or failure never fails the request; it is
+/// reported via `branch_deleted: false` + `branch_delete_error`.
 pub(crate) async fn server_branch_merge(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
@@ -1612,12 +1626,55 @@ pub(crate) async fn server_branch_merge(
             .await
             .map_err(ApiError::from_omni)?
     };
+    let (branch_deleted, branch_delete_error) = if request.delete_branch {
+        match delete_merged_source_branch(&handle, actor.as_ref().map(|Extension(a)| a), &request.source)
+            .await
+        {
+            Ok(()) => (Some(true), None),
+            Err(message) => (Some(false), Some(message)),
+        }
+    } else {
+        (None, None)
+    };
     Ok(Json(BranchMergeOutput {
         source: request.source,
         target,
         outcome: outcome.into(),
         actor_id: actor_id.map(str::to_string),
+        branch_deleted,
+        branch_delete_error,
     }))
+}
+
+/// Delete the source branch of a just-landed merge, mirroring
+/// `server_branch_delete`'s authorization (same action and target scope) but
+/// converting every failure — policy denial, dependent-branch refusal,
+/// operational error — into a message instead of an error status: the merge is
+/// already durable, so the request must not report failure for it.
+async fn delete_merged_source_branch(
+    handle: &GraphHandle,
+    actor: Option<&ResolvedActor>,
+    source: &str,
+) -> std::result::Result<(), String> {
+    match authorize(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::BranchDelete,
+            branch: None,
+            target_branch: Some(source.to_string()),
+        },
+    ) {
+        Ok(Authz::Allowed) => {}
+        Ok(Authz::Denied(message)) => return Err(message),
+        Err(err) => return Err(err.message),
+    }
+    let actor_id = actor.map(|actor| actor.actor_id.as_ref());
+    handle
+        .engine
+        .branch_delete_as(source, actor_id)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[utoipa::path(

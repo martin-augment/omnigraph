@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+pub mod cost;
+#[cfg(feature = "failpoints")]
+pub mod failpoint;
 pub mod recovery;
 
 use arrow_array::{Array, RecordBatch, StringArray};
@@ -44,6 +47,30 @@ query insert_person_and_friend($name: String, $age: I32, $friend: String) {
 }
 "#;
 
+/// A standalone Lance `Session` for tests that construct a `TableStore`
+/// directly (production stores share the graph's per-connection session;
+/// tests get a fresh one — the cache scope is the test).
+pub fn test_session() -> std::sync::Arc<lance::session::Session> {
+    std::sync::Arc::new(lance::session::Session::default())
+}
+
+/// Open the latest physical Lance head, optionally at a native branch.
+///
+/// Recovery/failpoint tests use this only to forge or inspect physical state
+/// that intentionally bypasses OmniGraph's manifest. Keeping the raw opener in
+/// test support avoids exposing the engine's crate-private `TableStore`.
+pub async fn open_dataset_head(uri: &str, branch: Option<&str>) -> lance::Dataset {
+    let ds = lance::dataset::builder::DatasetBuilder::from_uri(uri)
+        .with_session(test_session())
+        .load()
+        .await
+        .unwrap();
+    match branch {
+        Some(branch) if branch != "main" => ds.checkout_branch(branch).await.unwrap(),
+        _ => ds,
+    }
+}
+
 /// Init a graph and load the standard test data.
 pub async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
@@ -51,6 +78,9 @@ pub async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
     load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
+    // Mutation/load publish only exact data effects; physical indexes are
+    // reconciled separately as derived state.
+    db.ensure_indices().await.unwrap();
     db
 }
 
@@ -105,6 +135,26 @@ pub async fn count_rows_branch(db: &Omnigraph, branch: &str, table_key: &str) ->
     let snap = snapshot_branch(db, branch).await.unwrap();
     let ds = snap.open(table_key).await.unwrap();
     ds.count_rows(None).await.unwrap()
+}
+
+/// First result column as sorted strings — the shared shape the traversal /
+/// cost tests use to compare a query's returned names. Empty for a 0-row result.
+pub fn first_column_sorted(result: &QueryResult) -> Vec<String> {
+    if result.num_rows() == 0 {
+        return Vec::new();
+    }
+    let batch = result.concat_batches().unwrap();
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut v: Vec<String> = (0..col.len())
+        .filter(|&i| !col.is_null(i))
+        .map(|i| col.value(i).to_string())
+        .collect();
+    v.sort();
+    v
 }
 
 /// Collect all string values from a named column across batches.
@@ -175,6 +225,25 @@ pub async fn commit_many(db: &mut Omnigraph, n: usize) {
             MUTATION_QUERIES,
             "insert_person",
             &mixed_params(&[("$name", &format!("commit_many_{i}"))], &[("$age", 30)]),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// Like [`commit_many`] but every commit carries an actor in its inline
+/// `__manifest` lineage row — the authenticated (server/CLI) write path.
+pub async fn commit_many_as(db: &mut Omnigraph, n: usize, actor: &str) {
+    for i in 0..n {
+        db.mutate_as(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(
+                &[("$name", &format!("commit_many_as_{i}"))],
+                &[("$age", 30)],
+            ),
+            Some(actor),
         )
         .await
         .unwrap();

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
@@ -191,33 +192,95 @@ fn free_port() -> u16 {
     port
 }
 
-fn spawn_server_process(mut command: StdCommand) -> TestServer {
-    let port = free_port();
-    let bind = format!("127.0.0.1:{}", port);
-    let mut child = command
-        .arg("--bind")
-        .arg(&bind)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let base_url = format!("http://{}", bind);
-    let client = Client::new();
-    for _ in 0..300 {
-        if client
-            .get(format!("{}/healthz", base_url))
-            .send()
-            .map(|response| response.status().is_success())
-            .unwrap_or(false)
-        {
-            return TestServer { child, base_url };
+/// Rebuild a spawnable copy of `command` (program, args, envs, cwd).
+/// `StdCommand` is not `Clone`, and a retry cannot re-use the original —
+/// appending a second `--bind` would trip clap's duplicate-argument error.
+fn clone_command(command: &StdCommand) -> StdCommand {
+    let mut fresh = StdCommand::new(command.get_program());
+    fresh.args(command.get_args());
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => {
+                fresh.env(key, value);
+            }
+            None => {
+                fresh.env_remove(key);
+            }
         }
-        if let Some(status) = child.try_wait().unwrap() {
-            panic!("server exited before becoming healthy: {status}");
-        }
-        sleep(Duration::from_millis(100));
     }
-    panic!("server did not become healthy");
+    if let Some(dir) = command.get_current_dir() {
+        fresh.current_dir(dir);
+    }
+    fresh
+}
+
+fn spawn_server_process(command: StdCommand) -> TestServer {
+    // `free_port()` releases the port before the server rebinds it, so under
+    // parallel tests a concurrent spawn can steal it and the loser exits with
+    // "address in use" — retry on a fresh port. Stderr goes to a temp file
+    // (not a pipe: a chatty healthy server would fill a pipe's buffer and
+    // block; not null: a genuine startup failure must panic with the server's
+    // own error, not a bare exit status). The retry is a stop-gap: the design
+    // fix is the server binding :0 itself and reporting the bound address
+    // (#327), which removes the race window entirely.
+    const SPAWN_ATTEMPTS: usize = 5;
+    for attempt in 1..=SPAWN_ATTEMPTS {
+        let port = free_port();
+        let bind = format!("127.0.0.1:{}", port);
+        let mut stderr_log = tempfile::tempfile().unwrap();
+        let mut child = clone_command(&command)
+            .arg("--bind")
+            .arg(&bind)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_log.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        let base_url = format!("http://{}", bind);
+        let client = Client::new();
+        let mut early_exit = None;
+        for _ in 0..300 {
+            if client
+                .get(format!("{}/healthz", base_url))
+                .send()
+                .map(|response| response.status().is_success())
+                .unwrap_or(false)
+            {
+                return TestServer { child, base_url };
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                early_exit = Some(status);
+                break;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        let read_stderr = |log: &mut std::fs::File| {
+            let mut stderr = String::new();
+            let _ = log.seek(SeekFrom::Start(0));
+            let _ = log.read_to_string(&mut stderr);
+            stderr
+        };
+        let Some(status) = early_exit else {
+            // Stalled (alive but never healthy) — the server's own output is
+            // the most useful diagnostic here too, not just on early exit.
+            // Kill + wait first so the final stderr flush is captured.
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = read_stderr(&mut stderr_log);
+            panic!("server did not become healthy on {bind}; stderr:\n{stderr}");
+        };
+        let stderr = read_stderr(&mut stderr_log);
+        if attempt == SPAWN_ATTEMPTS {
+            panic!(
+                "server exited before becoming healthy on every port \
+                 ({SPAWN_ATTEMPTS} attempts; last: {status} on {bind}); stderr:\n{stderr}"
+            );
+        }
+        eprintln!(
+            "server spawn attempt {attempt}/{SPAWN_ATTEMPTS} exited early ({status} on {bind}), \
+             likely a lost port race — retrying on a fresh port; stderr:\n{stderr}"
+        );
+    }
+    unreachable!("loop either returns a healthy server or panics");
 }
 
 pub fn spawn_server(graph: &Path) -> TestServer {

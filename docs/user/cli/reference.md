@@ -16,18 +16,19 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `alias <name> [args]` | invoke an operator alias — a read-only personal binding (under `aliases:` in `~/.omnigraph/config.yaml`) to a stored query on a named server (replaces the removed `--alias` flag; stored mutations are rejected before execution) |
 | `snapshot` | print current snapshot (per-table version + row count) |
 | `export` | dump to JSONL on stdout (`--type T`, `--table K` filters) |
-| `branch create \| list \| delete \| merge` | branching ops |
+| `branch create \| list \| delete \| merge` | branching ops. `merge --delete-branch` deletes the source branch after a successful merge (its own `branch_delete` policy check; a refusal is a stderr warning, not a failure — see [merge](../branching/merge.md)) |
 | `commit list \| show` | inspect commit graph |
 | `schema plan \| apply \| show (alias: get)` | migrations. `apply` refuses a cluster-managed graph (one whose storage is inside a cluster) and points at `cluster apply` — those graphs evolve through the cluster ledger, not a direct apply |
 | `lint` (alias: `check`) | offline / graph-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
 | `cluster validate \| plan \| apply \| approve \| status \| refresh \| import \| force-unlock` | declarative cluster control plane. `validate` checks a local `cluster.yaml` folder and referenced schema/query/policy files; `plan` diffs it against local JSON state at `__cluster/state.json`, annotates dispositions, and embeds real schema-migration previews; `apply` converges the cluster — stored-query/policy catalog writes (content-addressed under `__cluster/resources/`), graph creates, schema updates (soft drops only; `--as` records the actor), and graph deletes behind a digest-bound approval from `cluster approve <resource> --as <actor>` (`apply`/`approve` default the actor from `~/.omnigraph/config.yaml`'s `operator.actor` when `--as` is omitted); what apply converges is what an `omnigraph-server --cluster <dir>` deployment serves on its next restart (`--cluster` is the server's only boot source — cluster-only); `status` reads the state ledger; `refresh`/`import` explicitly update local JSON state from read-only graph observations; `force-unlock <LOCK_ID>` manually removes a held local state lock by exact id |
-| `optimize` | non-destructive Lance compaction (skips tables with `Blob` columns or uncovered drift; `--json` reports `skipped`) |
+| `optimize` | non-destructive Lance compaction + index reconciliation (blob-bearing tables use the normal path; tables with uncovered drift are skipped and `--json` reports `skipped`) |
 | `repair [--confirm] [--force]` | preview or explicitly publish uncovered manifest/head drift. `--confirm` heals verified maintenance drift and exits non-zero if suspicious/unverifiable drift is refused; `--force --confirm` publishes suspicious/unverifiable drift after operator review |
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC (`--confirm` to execute; also needs `--yes` against a non-local `s3://` target — see *Write diagnostics & destructive confirmation*) |
 | `embed` | offline JSONL embedding pipeline |
 | `policy validate \| test \| explain` | Cedar tooling against a cluster's applied policies (`--cluster <dir>`; `--graph <id>` picks a graph's bundle when several apply). `test` takes `--tests <file>`; `explain` takes `--actor`/`--action`/`--branch`/`--target-branch` |
+| `queries list \| validate` | inspect a cluster's applied stored-query registry (`--cluster <dir\|uri>`; `--graph <id>` to scope one graph). `list` prints each query's kind (read/mutation), name, typed params, and `[mcp: …]` exposure; a query's `@description`/`@instruction` are shown as indented `description:` / `instruction:` lines when declared (omitted otherwise). `--json` emits `{name, mcp_expose, tool_name, mutation, params}` plus `description`/`instruction` **only when present** — matching the HTTP `GET /queries` catalog ([server.md](../operations/server.md)). `validate` type-checks the registry and exits non-zero on a broken query |
 | `profile list \| show [<name>]` | read-only inspection of `~/.omnigraph/config.yaml` profiles. `list` shows each profile's binding (server/cluster/store) + default graph and marks the `$OMNIGRAPH_PROFILE`-active one; JSON keeps `binding` and adds `scope_kind`, `target`, `valid`, and `error`; `show` resolves one profile's scope (endpoint + default graph), defaulting to the active profile, else the flat operator defaults |
-| `version` / `-v` | print `omnigraph 0.3.x` |
+| `version` / `-v` | print `omnigraph 0.7.x` |
 
 ## Command capabilities
 
@@ -188,22 +189,26 @@ omnigraph cluster import   --config company-brain --json
 omnigraph cluster force-unlock <LOCK_ID> --config company-brain --json
 ```
 
-`--config` is a directory containing `cluster.yaml`; it defaults to `.`.
-Stage 3A accepts graphs, schemas, stored queries, and policy bundle file
+`--config` is a directory containing `cluster.yaml`; it defaults to `.`. The
+config declares graphs, schemas, stored queries, and policy bundle file
 references. `cluster plan` reads local JSON state from
 `<config-dir>/__cluster/state.json`; a missing file means empty state. Plan,
 apply, refresh, and import acquire `__cluster/lock.json` by default and release
-it before returning. `cluster apply` executes only stored-query/policy catalog
-writes (content-addressed under `__cluster/resources/`) and requires an
-existing `state.json`; graph/schema changes are deferred with warnings, and
-applied resources do not serve traffic until an `omnigraph-server --cluster
-<dir>` restart picks them up. `cluster status` reads state only and reports any existing
-lock metadata. `force-unlock` removes a lock only when the supplied id exactly
-matches the lock file. `refresh` requires an existing `state.json`; `import`
-creates one only when it is missing. Both observe declared graphs read-only at
-`<config-dir>/graphs/<graph-id>.omni`. External state backends, graph/schema
-apply, automatic stale-lock breaking, `plan --refresh`, pipelines, UI specs,
-embeddings, aliases, and bindings are reserved for later stages. See
+it before returning. `cluster apply` converges the cluster to its config in one
+ordered run: it creates declared graphs, applies schema updates (soft drops
+only — see [schema](../schema/index.md)), writes stored-query/policy catalog
+resources (content-addressed under `__cluster/resources/`), and executes
+approved graph deletes; it requires an existing `state.json` (run `import`
+first). Applied state does not serve traffic until an `omnigraph-server
+--cluster <dir>` restart picks up the new revision. Standalone schema deletes
+remain unsupported and are reported as `deferred` with a warning. `cluster
+status` reads state only and reports any existing lock metadata. `force-unlock`
+removes a lock only when the supplied id exactly matches the lock file.
+`refresh` requires an existing `state.json`; `import` creates one only when it
+is missing. Both observe declared graphs read-only at
+`<config-dir>/graphs/<graph-id>.omni`. External state backends, automatic
+stale-lock breaking, `plan --refresh`, pipelines, UI specs, embeddings,
+aliases, and bindings are not yet supported. See
 [cluster-config.md](../clusters/config.md).
 
 ## Output formats (`query` command, alias: `read`)
@@ -220,9 +225,12 @@ Precedence (high to low): explicit `--params` / `--params-file`, alias positiona
 
 ## Bearer token resolution (CLI)
 
-1. `graphs.<name>.bearer_token_env`
-2. `OMNIGRAPH_BEARER_TOKEN` global env
-3. `auth.env_file` referenced `.env`
+See **Credentials keyed by server name** above: a remote command resolves its
+token via `OMNIGRAPH_TOKEN_<NAME>` env → the `[<name>]` section in
+`~/.omnigraph/credentials` → the default `OMNIGRAPH_BEARER_TOKEN` env, and a
+keyed token is only ever sent to the server it is keyed to. Plaintext tokens are
+never stored in operator config; the removed `omnigraph.yaml` keys
+(`graphs.<name>.bearer_token_env`, `auth.env_file`) no longer exist.
 
 ## Duration parsing (cleanup)
 

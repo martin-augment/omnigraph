@@ -12,6 +12,7 @@ constraints. User-facing behavior should still be documented through
 | Need | Read |
 |---|---|
 | Architectural rules, known gaps, deny-list | [invariants.md](invariants.md) |
+| Versioning & compatibility policy (release / wire / storage / Lance) | [versioning.md](versioning.md) |
 | Upstream Lance source-of-truth index | [lance.md](lance.md) |
 | Existing test coverage and test placement | [testing.md](testing.md) |
 
@@ -41,6 +42,7 @@ constraints. User-facing behavior should still be documented through
 | Error taxonomy and serialization | [errors.md](../user/operations/errors.md) |
 | Constants and tunables | [constants.md](../user/reference/constants.md) |
 | Transaction model public contract | [transactions.md](../user/branching/transactions.md) |
+| User-doc coherence cleanup ledger | [docs-issues.md](docs-issues.md) |
 
 ## Project Operations
 
@@ -62,6 +64,25 @@ The `docs/rfcs/` track is the **public, externally-authorable** RFC process. The
 maintainer/internal RFCs below (`rfc-00N-*.md`) are a separate, team-owned
 track; don't conflate the two.
 
+## Case Studies
+
+Worked write-ups of specific bugs — root cause, fix, and the reasoning that
+ruled out the tempting-but-wrong alternatives. Read these for the debugging
+pattern, not just the outcome.
+
+| Area | Read |
+|---|---|
+| camelCase property filters lowercased at runtime (#283) — two engine→Lance boundaries, two different fixes | [bug-case-fix.md](bug-case-fix.md) |
+
+## Active Design Reviews
+
+Review ledgers record open findings against proposed architecture. They remain
+as durable disposition history after closure, so RFC backlinks stay valid.
+
+| Area | Read |
+|---|---|
+| RFC-022–027 split architecture review — open correctness blockers, dependency corrections, and required acceptance evidence | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
+
 ## Active Implementation Plans
 
 Working documents for in-flight feature work. Removed when the work lands.
@@ -81,6 +102,9 @@ Working documents for in-flight feature work. Removed when the work lands.
 | Restructure the CLI around explicit planes — one graph-addressing model, declared capability surface, plane-grouped help (expands RFC-009 Phase 4) | [rfc-010-cli-planes-restructure.md](rfc-010-cli-planes-restructure.md) |
 | CLI refactoring — one addressing & config model post-`omnigraph.yaml`: scope + `--graph` + derived access path, served-default / privileged-direct, profiles, named queries, capability classifier (completes RFC-008) | [rfc-011-cli-refactoring.md](rfc-011-cli-refactoring.md) |
 | Provider-independent embedding configuration — one resolved `EmbeddingConfig` + sealed provider enum (Gemini/OpenAI/Mock), identity recorded in the schema IR, query-time same-space validation, NFR floor | [rfc-012-embedding-provider-config.md](rfc-012-embedding-provider-config.md) |
+| Write-path latency — capture-once `WriteTxn`, version-pinned opens, one `GraphPublishAuthority` fed declarative `PublishPlan`s, manifest-authoritative lineage, epoch fence, bounded history (compaction + cleanup), and an IO-counted cost contract (`iss-write-s3-roundtrip-amplification`, `iss-991`) | [rfc-013-write-path-latency.md](rfc-013-write-path-latency.md) |
+| RFC-013 handoff — current-state map, latest validation, and concrete next actions for finishing write-path latency and correctness work | [handoff-rfc-013-write-path.md](handoff-rfc-013-write-path.md) |
+| Write-latency roadmap — validated cost model (the 6-LIST warm-write trace), the two root causes (un-GC'd `_versions/`; re-resolving latest by listing), and the layered fix (GC + capture-once reuse); how commit-graph-table retirement feeds in | [write-latency-roadmap.md](write-latency-roadmap.md) |
 
 ## Boundary
 
